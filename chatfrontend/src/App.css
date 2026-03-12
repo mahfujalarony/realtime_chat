@@ -1,0 +1,74 @@
+.chat-wallpaper {
+  background-color: #efeae2;
+  background-image:
+    radial-gradient(circle at 25px 25px, rgba(255, 255, 255, 0.45) 2px, transparent 0),
+    radial-gradient(circle at 75px 75px, rgba(0, 0, 0, 0.04) 2px, transparent 0);
+  background-size: 100px 100px;
+}
+
+/* WhatsApp style message bubbles */
+.message-bubble {
+  position: relative;
+  max-width: 65%;
+  padding: 6px 7px 8px 9px;
+  border-radius: 7.5px;
+  box-shadow: 0 1px 0.5px rgba(11, 20, 26, 0.13);
+}
+
+.message-bubble.sent {
+  background-color: #d9fdd3;
+  border-top-right-radius: 0;
+  margin-left: auto;
+}
+
+.message-bubble.received {
+  background-color: #ffffff;
+  border-top-left-radius: 0;
+  margin-right: auto;
+}
+
+/* Message tail for sent messages */
+.message-bubble.sent::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: -8px;
+  width: 0;
+  height: 0;
+  border-left: 8px solid #d9fdd3;
+  border-top: 8px solid transparent;
+}
+
+/* Message tail for received messages */
+.message-bubble.received::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -8px;
+  width: 0;
+  height: 0;
+  border-right: 8px solid #ffffff;
+  border-top: 8px solid transparent;
+}
+
+/* Messages container */
+.messages-container {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+  justify-content: flex-end;
+}
+
+/* Scrollbar styling */
+.chat-scrollbar::-webkit-scrollbar {
+  width: 6px;
+}
+
+.chat-scrollbar::-webkit-scrollbar-thumb {
+  background-color: rgba(0, 0, 0, 0.2);
+  border-radius: 3px;
+}
+
+.chat-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
