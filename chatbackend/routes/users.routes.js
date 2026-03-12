@@ -5,6 +5,17 @@ const { User, Contact } = require('../models')
 
 const router = express.Router()
 
+function isProfileMediaUrlValidForUser(mediaUrl, username) {
+  try {
+    const parsed = new URL(mediaUrl)
+    const pathname = decodeURIComponent(parsed.pathname).toLowerCase()
+    const userPath = `/chat/${String(username).toLowerCase()}/`
+    return pathname.includes(`${userPath}profile/`)
+  } catch (error) {
+    return false
+  }
+}
+
 router.get('/', authMiddleware, async (req, res) => {
   try {
     const q = (req.query.q || '').trim()
@@ -24,7 +35,7 @@ router.get('/', authMiddleware, async (req, res) => {
         {
           model: User,
           as: 'contactUser',
-          attributes: ['id', 'username', 'email', 'mobileNumber', 'lastSeen', 'createdAt'],
+          attributes: ['id', 'username', 'email', 'mobileNumber', 'lastSeen', 'profileMediaUrl', 'createdAt'],
           where: contactUserWhere,
           required: true,
         },
@@ -50,7 +61,7 @@ router.post('/contacts', authMiddleware, async (req, res) => {
       where: {
         [Op.or]: [{ username: identifier }, { email: identifier }, { mobileNumber: identifier }],
       },
-      attributes: ['id', 'username', 'email', 'mobileNumber', 'lastSeen', 'createdAt'],
+      attributes: ['id', 'username', 'email', 'mobileNumber', 'lastSeen', 'profileMediaUrl', 'createdAt'],
     })
 
     if (!targetUser) {
@@ -97,6 +108,37 @@ router.delete('/contacts/:contactUserId', authMiddleware, async (req, res) => {
     return res.json({ message: 'Contact removed' })
   } catch (error) {
     return res.status(500).json({ message: 'Failed to remove contact', error: error.message })
+  }
+})
+
+router.post('/profile-media', authMiddleware, async (req, res) => {
+  try {
+    const profileMediaUrl = (req.body.profileMediaUrl || '').trim()
+    if (!profileMediaUrl) {
+      return res.status(400).json({ message: 'profileMediaUrl is required' })
+    }
+    if (!isProfileMediaUrlValidForUser(profileMediaUrl, req.user.username)) {
+      return res.status(400).json({
+        message: 'Invalid profile media URL path. It must be inside your chat/<username>/profile folder',
+      })
+    }
+
+    req.user.profileMediaUrl = profileMediaUrl
+    await req.user.save()
+
+    return res.json({
+      message: 'Profile media updated',
+      user: {
+        id: req.user.id,
+        username: req.user.username,
+        email: req.user.email,
+        mobileNumber: req.user.mobileNumber,
+        lastSeen: req.user.lastSeen,
+        profileMediaUrl: req.user.profileMediaUrl,
+      },
+    })
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to update profile media', error: error.message })
   }
 })
 

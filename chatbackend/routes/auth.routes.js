@@ -3,6 +3,7 @@ const { Op } = require('sequelize')
 const authMiddleware = require('../middleware/auth')
 const { User } = require('../models')
 const { signToken } = require('../utils/token')
+const { ensureUserFolder } = require('../utils/upload-server')
 
 const router = express.Router()
 
@@ -14,6 +15,7 @@ function serializeUser(user) {
     mobileNumber: user.mobileNumber,
     dateOfBirth: user.dateOfBirth,
     lastSeen: user.lastSeen,
+    profileMediaUrl: user.profileMediaUrl,
     createdAt: user.createdAt,
   }
 }
@@ -48,6 +50,16 @@ router.post('/register', async (req, res) => {
       passwordHash: password,
       lastSeen: new Date(),
     })
+
+    try {
+      await ensureUserFolder(user.username)
+    } catch (folderError) {
+      await user.destroy()
+      return res.status(502).json({
+        message: 'Registration failed because upload folder creation failed',
+        error: folderError.message,
+      })
+    }
 
     const token = signToken(user.id)
     return res.status(201).json({

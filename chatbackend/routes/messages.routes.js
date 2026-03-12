@@ -5,12 +5,42 @@ const { Message, User, Contact } = require('../models')
 
 const router = express.Router()
 
+function isSenderMediaUrlValid(mediaUrl, username, messageType) {
+  try {
+    const parsed = new URL(mediaUrl)
+    const pathname = decodeURIComponent(parsed.pathname).toLowerCase()
+    const userPath = `/chat/${String(username).toLowerCase()}/`
+    if (!pathname.includes(userPath)) return false
+
+    if (messageType === 'image') {
+      return pathname.includes(`${userPath}images/`)
+    }
+    if (messageType === 'video') {
+      return pathname.includes(`${userPath}videos/`)
+    }
+    if (messageType === 'audio') {
+      return pathname.includes(`${userPath}audios/`)
+    }
+    if (messageType === 'file') {
+      return pathname.includes(`${userPath}files/`)
+    }
+    return false
+  } catch (error) {
+    return false
+  }
+}
+
 function formatMessage(message) {
   return {
     id: message.id,
     senderId: message.senderId,
     receiverId: message.receiverId,
     text: message.text,
+    messageType: message.messageType,
+    mediaUrl: message.mediaUrl,
+    mediaMimeType: message.mediaMimeType,
+    mediaOriginalName: message.mediaOriginalName,
+    mediaDurationSec: message.mediaDurationSec,
     seen: message.seen,
     createdAt: message.createdAt,
   }
@@ -59,12 +89,37 @@ router.post('/:userId', authMiddleware, async (req, res) => {
   try {
     const otherUserId = Number(req.params.userId)
     const text = (req.body.text || '').trim()
+    const mediaUrl = (req.body.mediaUrl || '').trim()
+    const messageType = (req.body.messageType || 'text').trim().toLowerCase()
+    const mediaMimeType = (req.body.mediaMimeType || '').trim()
+    const mediaOriginalName = (req.body.mediaOriginalName || '').trim()
+    const rawDuration = req.body.mediaDurationSec
+    const mediaDurationSec = rawDuration !== null && rawDuration !== undefined && Number.isFinite(Number(rawDuration))
+      ? Math.max(0, Math.floor(Number(rawDuration)))
+      : null
 
     if (!Number.isInteger(otherUserId)) {
       return res.status(400).json({ message: 'Invalid userId' })
     }
-    if (!text) {
-      return res.status(400).json({ message: 'Message text is required' })
+    if (!text && !mediaUrl) {
+      return res.status(400).json({ message: 'Message text or mediaUrl is required' })
+    }
+    if (mediaUrl && !['image', 'video', 'audio', 'file'].includes(messageType)) {
+      return res.status(400).json({ message: 'messageType must be image, video, audio, or file when mediaUrl is provided' })
+    }
+    if (!mediaUrl && messageType !== 'text') {
+      return res.status(400).json({ message: 'messageType must be text when mediaUrl is empty' })
+    }
+    if (messageType !== 'audio' && mediaDurationSec !== null) {
+      return res.status(400).json({ message: 'mediaDurationSec is only allowed for audio messages' })
+    }
+    if (mediaDurationSec !== null && mediaDurationSec > 60 * 60) {
+      return res.status(400).json({ message: 'mediaDurationSec is too large' })
+    }
+    if (mediaUrl && !isSenderMediaUrlValid(mediaUrl, req.user.username, messageType)) {
+      return res.status(400).json({
+        message: 'Invalid media URL path. It must be inside your chat/<username>/images, videos, audios, or files folder',
+      })
     }
 
     const otherUser = await User.findByPk(otherUserId)
@@ -79,7 +134,12 @@ router.post('/:userId', authMiddleware, async (req, res) => {
     const message = await Message.create({
       senderId: req.user.id,
       receiverId: otherUserId,
-      text,
+      text: text || null,
+      messageType: mediaUrl ? messageType : 'text',
+      mediaUrl: mediaUrl || null,
+      mediaMimeType: mediaMimeType || null,
+      mediaOriginalName: mediaOriginalName || null,
+      mediaDurationSec: messageType === 'audio' ? mediaDurationSec : null,
     })
 
     const payload = formatMessage(message)

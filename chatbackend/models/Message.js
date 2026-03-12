@@ -17,7 +17,31 @@ module.exports = (sequelize, DataTypes) => {
       },
       text: {
         type: DataTypes.TEXT,
+        allowNull: true,
+      },
+      messageType: {
+        type: DataTypes.ENUM('text', 'image', 'video', 'audio', 'file'),
         allowNull: false,
+        defaultValue: 'text',
+      },
+      mediaUrl: {
+        type: DataTypes.STRING(1000),
+        allowNull: true,
+      },
+      mediaMimeType: {
+        type: DataTypes.STRING(120),
+        allowNull: true,
+      },
+      mediaOriginalName: {
+        type: DataTypes.STRING(255),
+        allowNull: true,
+      },
+      mediaDurationSec: {
+        type: DataTypes.INTEGER,
+        allowNull: true,
+        validate: {
+          min: 0,
+        },
       },
       seen: {
         type: DataTypes.BOOLEAN,

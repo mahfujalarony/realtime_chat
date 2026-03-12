@@ -4,6 +4,7 @@ const http = require('http')
 const express = require('express')
 const cors = require('cors')
 const jwt = require('jsonwebtoken')
+const { DataTypes } = require('sequelize')
 const { Server } = require('socket.io')
 const { sequelize, User, Message, Contact } = require('./models')
 const authRoutes = require('./routes/auth.routes')
@@ -95,6 +96,7 @@ io.on('connection', (socket) => {
         senderId: currentUserId,
         receiverId: toUserId,
         text,
+        messageType: 'text',
       })
 
       const messagePayload = {
@@ -102,6 +104,10 @@ io.on('connection', (socket) => {
         senderId: message.senderId,
         receiverId: message.receiverId,
         text: message.text,
+        messageType: message.messageType,
+        mediaUrl: message.mediaUrl,
+        mediaMimeType: message.mediaMimeType,
+        mediaOriginalName: message.mediaOriginalName,
         seen: message.seen,
         createdAt: message.createdAt,
       }
@@ -134,7 +140,23 @@ app.use((err, req, res, next) => {
 async function start() {
   try {
     await sequelize.authenticate()
-    await sequelize.sync()
+    const dbSyncMode = (process.env.DB_SYNC_MODE || 'safe').toLowerCase()
+    if (dbSyncMode === 'alter') {
+      await sequelize.sync({ alter: true })
+    } else if (dbSyncMode === 'force') {
+      await sequelize.sync({ force: true })
+    } else {
+      await sequelize.sync()
+    }
+    const queryInterface = sequelize.getQueryInterface()
+    const messagesTable = await queryInterface.describeTable('messages').catch(() => null)
+    if (messagesTable && !messagesTable.media_duration_sec) {
+      await queryInterface.addColumn('messages', 'media_duration_sec', {
+        type: DataTypes.INTEGER,
+        allowNull: true,
+      })
+    }
+    console.log(`Database sync mode: ${dbSyncMode}`)
     server.listen(port, () => {
       console.log(`Server listening on port ${port}`)
     })
