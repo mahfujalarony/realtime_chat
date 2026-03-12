@@ -1,19 +1,16 @@
-const { Sequelize } = require('sequelize');
-require('dotenv').config();
+const { Sequelize } = require('sequelize')
+require('dotenv').config()
 
-const sequelize = new Sequelize("chat2", "root", '', {
-  host: 'localhost',
-  dialect: 'mysql' 
-});
+const sequelize = new Sequelize(
+  process.env.DB_NAME || 'chat2',
+  process.env.DB_USER || 'root',
+  process.env.DB_PASSWORD || '',
+  {
+    host: process.env.DB_HOST || '127.0.0.1',
+    port: Number(process.env.DB_PORT || 3306),
+    dialect: 'mysql',
+    logging: false,
+  },
+)
 
-async function testConnection() {
-  try {
-    await sequelize.authenticate();
-  } catch (error) {
-
-  }
-}
-
-testConnection();
-
-module.exports = sequelize;
+module.exports = sequelize
