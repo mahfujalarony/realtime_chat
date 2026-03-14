@@ -6,11 +6,10 @@ const cors = require('cors')
 const jwt = require('jsonwebtoken')
 const { DataTypes } = require('sequelize')
 const { Server } = require('socket.io')
-const { sequelize, User, Message, Contact, GroupMember, GroupMessage, PushSubscription } = require('./models')
+const { sequelize, User, Message, Contact, PushSubscription } = require('./models')
 const authRoutes = require('./routes/auth.routes')
 const userRoutes = require('./routes/users.routes')
 const messageRoutes = require('./routes/messages.routes')
-const groupRoutes = require('./routes/groups.routes')
 const notificationsRoutes = require('./routes/notifications.routes')
 const { ensureUserUniqueUsername } = require('./utils/user-identity')
 const { sendPushNotification, isPushEnabled } = require('./utils/push')
@@ -108,7 +107,6 @@ app.get('/api/health', (req, res) => {
 app.use('/api/auth', authRoutes)
 app.use('/api/users', userRoutes)
 app.use('/api/messages', messageRoutes)
-app.use('/api/groups', groupRoutes)
 app.use('/api/notifications', notificationsRoutes)
 
 io.use(async (socket, next) => {
@@ -145,16 +143,6 @@ io.on('connection', (socket) => {
   if (existingSockets === 0) {
     io.emit('chat:presence', { userId: currentUserId, isOnline: true, lastSeen: socket.user.lastSeen })
   }
-
-  GroupMember.findAll({
-    where: { userId: currentUserId },
-    attributes: ['groupId'],
-    raw: true,
-  })
-    .then((memberships) => {
-      memberships.forEach((item) => socket.join(`group:${item.groupId}`))
-    })
-    .catch(() => null)
 
   socket.on('chat:send', async (payload, ack) => {
     try {
@@ -204,48 +192,6 @@ io.on('connection', (socket) => {
       if (typeof ack === 'function') ack({ ok: true, message: messagePayload })
     } catch (error) {
       if (typeof ack === 'function') ack({ ok: false, message: 'Failed to send message' })
-    }
-  })
-
-  socket.on('chat:group-send', async (payload, ack) => {
-    try {
-      const groupId = Number(payload?.groupId)
-      const text = (payload?.text || '').trim()
-      if (!Number.isInteger(groupId) || !text) {
-        if (typeof ack === 'function') ack({ ok: false, message: 'Invalid payload' })
-        return
-      }
-
-      const membership = await GroupMember.findOne({ where: { groupId, userId: currentUserId } })
-      if (!membership) {
-        if (typeof ack === 'function') ack({ ok: false, message: 'You are not a member of this group' })
-        return
-      }
-
-      const message = await GroupMessage.create({
-        groupId,
-        senderId: currentUserId,
-        text,
-        messageType: 'text',
-      })
-      const messagePayload = {
-        id: message.id,
-        groupId: message.groupId,
-        senderId: message.senderId,
-        text: message.text,
-        messageType: message.messageType,
-        mediaUrl: message.mediaUrl,
-        mediaMimeType: message.mediaMimeType,
-        mediaOriginalName: message.mediaOriginalName,
-        mediaDurationSec: message.mediaDurationSec,
-        createdAt: message.createdAt,
-      }
-
-      await GroupMember.update({ lastReadAt: new Date() }, { where: { groupId, userId: currentUserId } })
-      io.to(`group:${groupId}`).emit('chat:group-message', messagePayload)
-      if (typeof ack === 'function') ack({ ok: true, message: messagePayload })
-    } catch (error) {
-      if (typeof ack === 'function') ack({ ok: false, message: 'Failed to send group message' })
     }
   })
 
@@ -352,7 +298,6 @@ async function start() {
     const queryInterface = sequelize.getQueryInterface()
     const messagesTable = await queryInterface.describeTable('messages').catch(() => null)
     const usersTable = await queryInterface.describeTable('users').catch(() => null)
-    const groupMessagesTable = await queryInterface.describeTable('group_messages').catch(() => null)
     if (messagesTable && !messagesTable.media_duration_sec) {
       await queryInterface.addColumn('messages', 'media_duration_sec', {
         type: DataTypes.INTEGER,
@@ -361,12 +306,6 @@ async function start() {
     }
     if (messagesTable && !messagesTable.media_group_id) {
       await queryInterface.addColumn('messages', 'media_group_id', {
-        type: DataTypes.STRING(80),
-        allowNull: true,
-      })
-    }
-    if (groupMessagesTable && !groupMessagesTable.media_group_id) {
-      await queryInterface.addColumn('group_messages', 'media_group_id', {
         type: DataTypes.STRING(80),
         allowNull: true,
       })

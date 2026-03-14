@@ -1,4 +1,4 @@
-import { ArrowLeft, Camera, EllipsisVertical, LogOut, MessageCirclePlus, Search, UserPlus, Users, UsersRound } from 'lucide-react'
+import { ArrowLeft, Camera, EllipsisVertical, LogOut, MessageCirclePlus, Search, UserPlus, Users } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 
 function ChatSidebar({
@@ -16,13 +16,10 @@ function ChatSidebar({
   onUploadProfile,
   error,
   filteredUsers,
-  filteredGroups,
   activeConversation,
   openConversation,
-  openCreateGroup,
   getInitials,
   getLastMessageForUser,
-  getLastMessageForGroup,
   formatTime,
   formatLastSeen,
   onReachListEnd,
@@ -264,65 +261,6 @@ function ChatSidebar({
           )
         })}
 
-        <li className="px-4 pt-3 text-[11px] font-semibold uppercase tracking-wide text-[#667781]">Group chats</li>
-        {filteredGroups.length === 0 ? (
-          <li className="px-4 py-2">
-            <div className="rounded-xl border border-[#e3e9ec] bg-[#f7fbfd] p-3">
-              <div className="flex items-start gap-3">
-                <span className="mt-0.5 flex h-8 w-8 items-center justify-center rounded-full bg-[#dff6e9] text-[#0f8d4a]">
-                  <UsersRound size={16} />
-                </span>
-                <div className="min-w-0">
-                  <p className="text-sm font-semibold text-[#1f2c34]">Create a new group</p>
-                  <p className="mt-0.5 text-xs text-[#667781]">Add friends and start group chatting.</p>
-                  <button
-                    type="button"
-                    onClick={openCreateGroup}
-                    className="mt-2 rounded-md bg-[#25d366] px-2.5 py-1 text-[11px] font-semibold text-white transition hover:bg-[#1fab53]"
-                  >
-                    New group
-                  </button>
-                </div>
-              </div>
-            </div>
-          </li>
-        ) : null}
-        {filteredGroups.map((group) => {
-          const lastMessage = getLastMessageForGroup(group.id)
-          return (
-            <li key={`group-${group.id}`}>
-              <button
-                type="button"
-                onClick={() => openConversation({ type: 'group', id: group.id })}
-                className={`w-full cursor-pointer border-b border-[#ececec] px-4 py-3 text-left transition ${
-                  isActiveConversation('group', group.id) ? 'bg-[#ebf8f1]' : 'hover:bg-[#f2f3f5]'
-                }`}
-              >
-                <div className="flex items-start gap-3">
-                  <div className="flex h-11 w-11 items-center justify-center overflow-hidden rounded-full bg-[#b7d2c2] text-[#1a5c3f]">
-                    <UsersRound size={18} />
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center justify-between gap-2">
-                      <p className="truncate text-sm font-semibold text-[#1f2c34]">{group.name}</p>
-                      <div className="flex items-center gap-2">
-                        <p className="text-xs text-[#667781]">{lastMessage ? formatTime(lastMessage.createdAt) : ''}</p>
-                        {Number(group.unreadCount) > 0 ? (
-                          <span className="rounded-full bg-[#25d366] px-1.5 py-0.5 text-[10px] font-semibold text-white">
-                            {group.unreadCount}
-                          </span>
-                        ) : null}
-                      </div>
-                    </div>
-                    <p className="mt-1 truncate text-sm text-[#667781]">
-                      {lastMessage ? lastMessage.text || lastMessage.messageType : `${group.members?.length || 0} members`}
-                    </p>
-                  </div>
-                </div>
-              </button>
-            </li>
-          )
-        })}
       </ul>
 
       {loadingMoreSidebar ? (
@@ -363,20 +301,6 @@ function ChatSidebar({
           </form>
 
           <div className="space-y-2 px-4">
-            <button
-              type="button"
-              onClick={() => {
-                setIsAddContactOpen(false)
-                openCreateGroup()
-              }}
-              className="flex w-full items-center gap-4 rounded-lg px-2 py-2.5 text-left transition hover:bg-[#f4f6f8]"
-            >
-              <span className="flex h-12 w-12 items-center justify-center rounded-full bg-[#25d366] text-white">
-                <UsersRound size={20} />
-              </span>
-              <span className="text-lg font-medium text-[#111b21]">New group</span>
-            </button>
-
             <button
               type="button"
               onClick={() => newChatInputRef.current?.focus()}

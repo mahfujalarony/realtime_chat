@@ -35,14 +35,10 @@ function App() {
   const [users, setUsers] = useState([])
   const [groups, setGroups] = useState([])
   const [usersPage, setUsersPage] = useState(1)
-  const [groupsPage, setGroupsPage] = useState(1)
   const [usersHasMore, setUsersHasMore] = useState(true)
-  const [groupsHasMore, setGroupsHasMore] = useState(true)
   const [loadingMoreSidebar, setLoadingMoreSidebar] = useState(false)
   const [messagesByUser, setMessagesByUser] = useState({})
-  const [groupMessagesById, setGroupMessagesById] = useState({})
   const [directPaginationById, setDirectPaginationById] = useState({})
-  const [groupPaginationById, setGroupPaginationById] = useState({})
   const [activeConversation, setActiveConversation] = useState(null)
   const [searchQuery, setSearchQuery] = useState('')
   const [draftMessage, setDraftMessage] = useState('')
@@ -60,10 +56,6 @@ function App() {
   const [pendingMedia, setPendingMedia] = useState([])
   const [uploadingProfile, setUploadingProfile] = useState(false)
   const [registerProfileFile, setRegisterProfileFile] = useState(null)
-  const [isCreateGroupOpen, setIsCreateGroupOpen] = useState(false)
-  const [groupNameInput, setGroupNameInput] = useState('')
-  const [groupMemberIds, setGroupMemberIds] = useState([])
-  const [creatingGroup, setCreatingGroup] = useState(false)
   const [incomingCall, setIncomingCall] = useState(null)
   const [outgoingCall, setOutgoingCall] = useState(null)
   const [activeCall, setActiveCall] = useState(null)
@@ -81,7 +73,6 @@ function App() {
   const messageListRef = useRef(null)
   const suppressAutoScrollRef = useRef(false)
   const seenRequestRef = useRef({})
-  const groupSeenRequestRef = useRef({})
   const serviceWorkerRegRef = useRef(null)
   const ringtoneIntervalRef = useRef(null)
   const ringtoneAudioContextRef = useRef(null)
@@ -90,32 +81,18 @@ function App() {
   const activeConversationType = activeConversation?.type || null
   const activeChat = useMemo(() => {
     if (!activeConversation) return null
-    if (activeConversation.type === 'group') return groups.find((g) => g.id === activeConversation.id) || null
     return users.find((u) => u.id === activeConversation.id) || null
-  }, [activeConversation, groups, users])
+  }, [activeConversation, users])
 
   const activeMessages = useMemo(() => {
     if (!activeConversation) return []
-    return activeConversation.type === 'group'
-      ? groupMessagesById[String(activeConversation.id)] || []
-      : messagesByUser[String(activeConversation.id)] || []
-  }, [activeConversation, groupMessagesById, messagesByUser])
+    return messagesByUser[String(activeConversation.id)] || []
+  }, [activeConversation, messagesByUser])
 
   const activePaginationMeta = useMemo(() => {
     if (!activeConversation) return { hasMore: false, loadingOlder: false }
-    if (activeConversation.type === 'group') {
-      return groupPaginationById[String(activeConversation.id)] || { hasMore: false, loadingOlder: false }
-    }
     return directPaginationById[String(activeConversation.id)] || { hasMore: false, loadingOlder: false }
-  }, [activeConversation, directPaginationById, groupPaginationById])
-
-  const groupMemberNames = useMemo(() => {
-    if (activeConversationType !== 'group' || !activeChat?.members) return {}
-    return activeChat.members.reduce((acc, member) => {
-      acc[member.id] = member.username
-      return acc
-    }, {})
-  }, [activeChat, activeConversationType])
+  }, [activeConversation, directPaginationById])
 
   const replaceTempWithServerMessage = (list, tempId, serverMessage) => {
     const hasServer = list.some((m) => m.id === serverMessage?.id)
@@ -260,13 +237,9 @@ function App() {
     setUsers([])
     setGroups([])
     setUsersPage(1)
-    setGroupsPage(1)
     setUsersHasMore(true)
-    setGroupsHasMore(true)
     setMessagesByUser({})
-    setGroupMessagesById({})
     setDirectPaginationById({})
-    setGroupPaginationById({})
     setActiveConversation(null)
     setError(message)
     setIncomingCall(null)
@@ -354,17 +327,6 @@ function App() {
     return incoming
   }
 
-  const fetchGroups = async (authToken = token, options = {}) => {
-    const page = Number(options.page) > 0 ? Number(options.page) : 1
-    const append = Boolean(options.append)
-    const data = await apiFetch(`/api/groups?page=${page}&limit=${CHAT_LIST_PAGE_SIZE}`, {}, authToken)
-    const incoming = data.groups || []
-    setGroups((prev) => (append ? mergeUniqueById(prev, incoming) : incoming))
-    setGroupsPage(page)
-    setGroupsHasMore(Boolean(data.hasMore))
-    return incoming
-  }
-
   const loadDirectConversation = async (id, authToken = token, options = {}) => {
     const appendOlder = Boolean(options.appendOlder)
     const currentMeta = directPaginationById[String(id)] || { hasMore: true, loadingOlder: false, nextBeforeId: null, initialized: false }
@@ -401,54 +363,8 @@ function App() {
     return incoming.length > 0
   }
 
-  const loadGroupConversation = async (id, authToken = token, options = {}) => {
-    const appendOlder = Boolean(options.appendOlder)
-    const currentMeta = groupPaginationById[String(id)] || { hasMore: true, loadingOlder: false, nextBeforeId: null, initialized: false }
-    if (appendOlder && (currentMeta.loadingOlder || !currentMeta.hasMore)) return false
-
-    const beforeId = appendOlder ? currentMeta.nextBeforeId : null
-    setGroupPaginationById((prev) => ({
-      ...prev,
-      [String(id)]: { ...currentMeta, loadingOlder: appendOlder ? true : false },
-    }))
-
-    const params = new URLSearchParams({ limit: String(MESSAGE_PAGE_SIZE) })
-    if (beforeId) params.set('beforeId', String(beforeId))
-    const data = await apiFetch(`/api/groups/${id}/messages?${params.toString()}`, {}, authToken)
-    const incoming = data.messages || []
-    setGroupMessagesById((prev) => {
-      const key = String(id)
-      const existing = prev[key] || []
-      return {
-        ...prev,
-        [key]: appendOlder ? [...incoming, ...existing] : incoming,
-      }
-    })
-    setGroupPaginationById((prev) => ({
-      ...prev,
-      [String(id)]: {
-        hasMore: Boolean(data.hasMore),
-        loadingOlder: false,
-        nextBeforeId: data.nextBeforeId || null,
-        initialized: true,
-      },
-    }))
-    await markGroupSeen(id)
-    return incoming.length > 0
-  }
-
-  const markGroupSeen = async (groupId) => {
-    if (groupSeenRequestRef.current[groupId]) return
-    groupSeenRequestRef.current[groupId] = true
-    try {
-      await apiFetch(`/api/groups/${groupId}/seen`, { method: 'POST' })
-      setGroups((prev) => prev.map((g) => (g.id === groupId ? { ...g, unreadCount: 0 } : g)))
-    } finally {
-      groupSeenRequestRef.current[groupId] = false
-    }
-  }
-
   const openConversation = async (conversation) => {
+    if (conversation.type !== 'direct') return
     setActiveConversation(conversation)
     setIsMobileChatOpen(true)
     setIsProfileOpen(false)
@@ -457,13 +373,8 @@ function App() {
       window.history.pushState({ mobileChatOpen: true, conversation }, '')
     }
     try {
-      if (conversation.type === 'group') {
-        const meta = groupPaginationById[String(conversation.id)]
-        if (!meta?.initialized) await loadGroupConversation(conversation.id)
-      } else {
-        const meta = directPaginationById[String(conversation.id)]
-        if (!meta?.initialized) await loadDirectConversation(conversation.id)
-      }
+      const meta = directPaginationById[String(conversation.id)]
+      if (!meta?.initialized) await loadDirectConversation(conversation.id)
       suppressAutoScrollRef.current = false
       forceScrollToBottom(8)
     } catch (e) {
@@ -479,11 +390,7 @@ function App() {
     suppressAutoScrollRef.current = true
 
     try {
-      if (activeConversation.type === 'group') {
-        await loadGroupConversation(activeConversation.id, token, { appendOlder: true })
-      } else {
-        await loadDirectConversation(activeConversation.id, token, { appendOlder: true })
-      }
+      await loadDirectConversation(activeConversation.id, token, { appendOlder: true })
 
       requestAnimationFrame(() => {
         const node = messageListRef.current
@@ -503,13 +410,10 @@ function App() {
 
   const loadMoreSidebarData = async () => {
     if (loadingMoreSidebar) return
-    if (!usersHasMore && !groupsHasMore) return
+    if (!usersHasMore) return
     setLoadingMoreSidebar(true)
     try {
-      const tasks = []
-      if (usersHasMore) tasks.push(fetchContacts(token, { page: usersPage + 1, append: true }))
-      if (groupsHasMore) tasks.push(fetchGroups(token, { page: groupsPage + 1, append: true }))
-      await Promise.all(tasks)
+      if (usersHasMore) await fetchContacts(token, { page: usersPage + 1, append: true })
     } catch (err) {
       setError(err.message)
     } finally {
@@ -593,18 +497,11 @@ function App() {
         if (!mounted) return
         setCurrentUser(me.user)
         ensurePushSubscription(token).catch(() => null)
-        const [fetchedUsers, fetchedGroups] = await Promise.all([
-          fetchContacts(token, { page: 1, append: false }),
-          fetchGroups(token, { page: 1, append: false }),
-        ])
+        const fetchedUsers = await fetchContacts(token, { page: 1, append: false })
         if (!mounted) return
         if (fetchedUsers[0]) {
           setActiveConversation({ type: 'direct', id: fetchedUsers[0].id })
           await loadDirectConversation(fetchedUsers[0].id, token)
-          forceScrollToBottom(8)
-        } else if (fetchedGroups[0]) {
-          setActiveConversation({ type: 'group', id: fetchedGroups[0].id })
-          await loadGroupConversation(fetchedGroups[0].id, token)
           forceScrollToBottom(8)
         }
 
@@ -621,25 +518,6 @@ function App() {
           if (!isFromMe && !(activeConversation?.type === 'direct' && Number(activeConversation.id) === Number(otherId))) {
             setUsers((prev) => prev.map((u) => (u.id === otherId ? { ...u, unreadCount: (Number(u.unreadCount) || 0) + 1 } : u)))
           }
-        })
-        socket.on('chat:group-message', (message) => {
-          setGroupMessagesById((prev) => {
-            const key = String(message.groupId)
-            const list = prev[key] || []
-            if (list.some((m) => m.id === message.id)) return prev
-            return { ...prev, [key]: [...list, message] }
-          })
-          setGroups((prev) =>
-            prev.map((g) => {
-              if (g.id !== message.groupId) return g
-              const isOpen = activeConversation?.type === 'group' && Number(activeConversation.id) === Number(g.id)
-              const fromMe = Number(message.senderId) === Number(me.user.id)
-              return { ...g, lastMessage: message, unreadCount: !isOpen && !fromMe ? (Number(g.unreadCount) || 0) + 1 : g.unreadCount || 0 }
-            }),
-          )
-        })
-        socket.on('chat:group-created', (group) => {
-          setGroups((prev) => (prev.some((g) => g.id === group.id) ? prev : [group, ...prev]))
         })
         socket.on('chat:presence', (payload) => {
           setUsers((prev) => prev.map((u) => (u.id === payload.userId ? { ...u, isOnline: payload.isOnline, lastSeen: payload.lastSeen } : u)))
@@ -728,12 +606,6 @@ function App() {
     return users.filter((u) => u.username.toLowerCase().includes(q) || (u.email || '').toLowerCase().includes(q) || (u.mobileNumber || '').toLowerCase().includes(q))
   }, [users, searchQuery])
 
-  const filteredGroups = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase()
-    if (!q) return groups
-    return groups.filter((g) => g.name.toLowerCase().includes(q))
-  }, [groups, searchQuery])
-
   const getInitials = (name = '') => name.split(' ').map((p) => p[0]).join('').slice(0, 2).toUpperCase()
   const formatTime = (value) => (value ? new Date(value).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '')
   const formatLastSeen = (value) => {
@@ -749,11 +621,6 @@ function App() {
     const list = messagesByUser[String(id)] || []
     return list[list.length - 1] || null
   }
-  const getLastMessageForGroup = (id) => {
-    const list = groupMessagesById[String(id)] || []
-    return list[list.length - 1] || groups.find((g) => g.id === id)?.lastMessage || null
-  }
-
   const onLogin = async (e) => {
     e.preventDefault()
     setSubmitting(true)
@@ -828,15 +695,13 @@ function App() {
     const temp = {
       id: tempId,
       senderId: currentUser.id,
-      receiverId: activeConversation.type === 'direct' ? activeConversation.id : null,
-      groupId: activeConversation.type === 'group' ? activeConversation.id : null,
+      receiverId: activeConversation.id,
       text,
       messageType: 'text',
       createdAt: new Date().toISOString(),
       clientStatus: 'sending',
     }
-    const targetSetter = activeConversation.type === 'group' ? setGroupMessagesById : setMessagesByUser
-    targetSetter((prev) => {
+    setMessagesByUser((prev) => {
       const key = String(activeConversation.id)
       return { ...prev, [key]: [...(prev[key] || []), temp] }
     })
@@ -854,22 +719,9 @@ function App() {
       })
       return
     }
-    if (socket?.connected && activeConversation.type === 'group') {
-      socket.emit('chat:group-send', { groupId: activeConversation.id, text }, (ack) => {
-        if (!ack?.ok) return setError(ack?.message || 'Group message failed')
-        setGroupMessagesById((prev) => {
-          const key = String(activeConversation.id)
-          const list = prev[key] || []
-          return { ...prev, [key]: replaceTempWithServerMessage(list, tempId, ack.message) }
-        })
-      })
-      return
-    }
-
     try {
-      const path = activeConversation.type === 'group' ? `/api/groups/${activeConversation.id}/messages` : `/api/messages/${activeConversation.id}`
-      const data = await apiFetch(path, { method: 'POST', body: JSON.stringify({ text }) })
-      targetSetter((prev) => {
+      const data = await apiFetch(`/api/messages/${activeConversation.id}`, { method: 'POST', body: JSON.stringify({ text }) })
+      setMessagesByUser((prev) => {
         const key = String(activeConversation.id)
         const list = prev[key] || []
         return { ...prev, [key]: replaceTempWithServerMessage(list, tempId, data.message) }
@@ -889,8 +741,7 @@ function App() {
     if (!options.skipUploadingState) setUploadingMedia(true)
     try {
       const mediaUrl = await uploadToExternalServer(file, mediaFolder)
-      const path = activeConversation.type === 'group' ? `/api/groups/${activeConversation.id}/messages` : `/api/messages/${activeConversation.id}`
-      const data = await apiFetch(path, {
+      const data = await apiFetch(`/api/messages/${activeConversation.id}`, {
         method: 'POST',
         body: JSON.stringify({
           mediaUrl,
@@ -902,21 +753,12 @@ function App() {
           text: '',
         }),
       })
-      if (activeConversation.type === 'group') {
-        setGroupMessagesById((prev) => {
-          const key = String(activeConversation.id)
-          const list = prev[key] || []
-          if (list.some((m) => m.id === data.message?.id)) return prev
-          return { ...prev, [key]: [...list, data.message] }
-        })
-      } else {
-        setMessagesByUser((prev) => {
-          const key = String(activeConversation.id)
-          const list = prev[key] || []
-          if (list.some((m) => m.id === data.message?.id)) return prev
-          return { ...prev, [key]: [...list, data.message] }
-        })
-      }
+      setMessagesByUser((prev) => {
+        const key = String(activeConversation.id)
+        const list = prev[key] || []
+        if (list.some((m) => m.id === data.message?.id)) return prev
+        return { ...prev, [key]: [...list, data.message] }
+      })
     } catch (err) {
       setError(err.message)
     } finally {
@@ -992,23 +834,6 @@ function App() {
       setError(err.message)
     } finally {
       setUploadingProfile(false)
-    }
-  }
-
-  const createGroup = async () => {
-    if (!groupNameInput.trim() || groupMemberIds.length === 0) return
-    setCreatingGroup(true)
-    try {
-      const data = await apiFetch('/api/groups', { method: 'POST', body: JSON.stringify({ name: groupNameInput.trim(), memberIds: groupMemberIds }) })
-      setGroups((prev) => (prev.some((g) => g.id === data.group.id) ? prev : [data.group, ...prev]))
-      setIsCreateGroupOpen(false)
-      setGroupNameInput('')
-      setGroupMemberIds([])
-      await openConversation({ type: 'group', id: data.group.id })
-    } catch (err) {
-      setError(err.message)
-    } finally {
-      setCreatingGroup(false)
     }
   }
 
@@ -1155,13 +980,10 @@ function App() {
           onUploadProfile={uploadProfileMedia}
           error={error}
           filteredUsers={filteredUsers}
-          filteredGroups={filteredGroups}
           activeConversation={activeConversation}
           openConversation={openConversation}
-          openCreateGroup={() => setIsCreateGroupOpen(true)}
           getInitials={getInitials}
           getLastMessageForUser={getLastMessageForUser}
-          getLastMessageForGroup={getLastMessageForGroup}
           formatTime={formatTime}
           formatLastSeen={formatLastSeen}
           onReachListEnd={loadMoreSidebarData}
@@ -1173,10 +995,8 @@ function App() {
           backToList={backToList}
           activeChat={activeChat}
           activeConversationType={activeConversationType}
-          groupMemberNames={groupMemberNames}
-          openProfile={() => {
-            if (activeConversationType !== 'group') setIsProfileOpen(true)
-          }}
+          groupMemberNames={{}}
+          openProfile={() => setIsProfileOpen(true)}
           startAudioCall={() => startDirectCall('audio')}
           startVideoCall={() => startDirectCall('video')}
           getInitials={getInitials}
@@ -1339,42 +1159,6 @@ function App() {
           peerUser={activeCall?.peerUser || null}
           callStatus={activeCall?.status || 'connecting'}
         />
-
-        {isCreateGroupOpen ? (
-          <div className="absolute inset-0 z-40 grid place-items-center bg-black/35 p-4">
-            <div className="w-full max-w-lg rounded-xl bg-white p-4 shadow-xl">
-              <p className="text-lg font-semibold text-[#1f2c34]">Create group</p>
-              <input
-                type="text"
-                value={groupNameInput}
-                onChange={(e) => setGroupNameInput(e.target.value)}
-                placeholder="Group name"
-                className="mt-3 w-full rounded-lg border border-[#d8dde1] px-3 py-2 text-sm outline-none focus:border-[#25d366]"
-              />
-              <div className="mt-3 max-h-64 space-y-2 overflow-y-auto rounded-lg border border-[#ecf0f2] p-2">
-                {users.map((user) => (
-                  <label key={user.id} className="flex cursor-pointer items-center gap-3 rounded-md px-2 py-2 hover:bg-[#f6f8f9]">
-                    <input
-                      type="checkbox"
-                      checked={groupMemberIds.includes(user.id)}
-                      onChange={(e) => {
-                        if (e.target.checked) setGroupMemberIds((prev) => [...prev, user.id])
-                        else setGroupMemberIds((prev) => prev.filter((id) => id !== user.id))
-                      }}
-                    />
-                    <span className="text-sm text-[#1f2c34]">{user.username}</span>
-                  </label>
-                ))}
-              </div>
-              <div className="mt-4 flex justify-end gap-2">
-                <button type="button" onClick={() => setIsCreateGroupOpen(false)} className="rounded-md border border-[#d7dce0] px-3 py-1.5 text-sm text-[#1f2c34]">Cancel</button>
-                <button type="button" disabled={creatingGroup} onClick={createGroup} className="rounded-md bg-[#25d366] px-3 py-1.5 text-sm font-semibold text-white disabled:opacity-60">
-                  {creatingGroup ? 'Creating...' : 'Create group'}
-                </button>
-              </div>
-            </div>
-          </div>
-        ) : null}
       </section>
     </main>
   )
