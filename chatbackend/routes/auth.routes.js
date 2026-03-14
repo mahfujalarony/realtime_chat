@@ -81,7 +81,8 @@ router.post('/register', async (req, res) => {
 
 router.post('/login', async (req, res) => {
   try {
-    const identifier = req.body.identifier || req.body.username
+    const identifierRaw = req.body.identifier || req.body.username
+    const identifier = String(identifierRaw || '').trim()
     const { password } = req.body
 
     if (!identifier || !password) {

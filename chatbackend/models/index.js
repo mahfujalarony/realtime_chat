@@ -6,6 +6,7 @@ const createContact = require('./Contact')
 const createGroup = require('./Group')
 const createGroupMember = require('./GroupMember')
 const createGroupMessage = require('./GroupMessage')
+const createPushSubscription = require('./PushSubscription')
 
 const User = createUser(sequelize, DataTypes)
 const Message = createMessage(sequelize, DataTypes)
@@ -13,6 +14,7 @@ const Contact = createContact(sequelize, DataTypes)
 const Group = createGroup(sequelize, DataTypes)
 const GroupMember = createGroupMember(sequelize, DataTypes)
 const GroupMessage = createGroupMessage(sequelize, DataTypes)
+const PushSubscription = createPushSubscription(sequelize, DataTypes)
 
 User.hasMany(Message, { foreignKey: 'senderId', as: 'sentMessages' })
 User.hasMany(Message, { foreignKey: 'receiverId', as: 'receivedMessages' })
@@ -36,6 +38,9 @@ GroupMessage.belongsTo(Group, { foreignKey: 'groupId', as: 'group' })
 User.hasMany(GroupMessage, { foreignKey: 'senderId', as: 'sentGroupMessages' })
 GroupMessage.belongsTo(User, { foreignKey: 'senderId', as: 'sender' })
 
+User.hasMany(PushSubscription, { foreignKey: 'userId', as: 'pushSubscriptions' })
+PushSubscription.belongsTo(User, { foreignKey: 'userId', as: 'user' })
+
 module.exports = {
   sequelize,
   User,
@@ -44,4 +49,5 @@ module.exports = {
   Group,
   GroupMember,
   GroupMessage,
+  PushSubscription,
 }

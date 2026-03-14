@@ -1,4 +1,4 @@
-import { ArrowLeft, Download, FileText, Loader2, Maximize2, Mic, Paperclip, Pause, Play, Square, Trash2, UsersRound, X } from 'lucide-react'
+import { ArrowLeft, Download, FileText, Loader2, Maximize2, Mic, Paperclip, Pause, Phone, Play, Square, Trash2, UsersRound, Video, X } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 
 const AUDIO_MIME_CANDIDATES = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus']
@@ -161,6 +161,8 @@ function ChatPanel({
   activeConversationType,
   groupMemberNames,
   openProfile,
+  startAudioCall,
+  startVideoCall,
   getInitials,
   profileMenuOpen,
   setProfileMenuOpen,
@@ -447,6 +449,28 @@ function ChatPanel({
               </p>
             </button>
             <div className="relative ml-auto">
+              {activeConversationType === 'direct' ? (
+                <div className="mr-2 inline-flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={startAudioCall}
+                    className="rounded-full p-2 text-[#54656f] transition hover:bg-[#e7ecef]"
+                    title="Audio call"
+                    aria-label="Audio call"
+                  >
+                    <Phone size={18} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={startVideoCall}
+                    className="rounded-full p-2 text-[#54656f] transition hover:bg-[#e7ecef]"
+                    title="Video call"
+                    aria-label="Video call"
+                  >
+                    <Video size={18} />
+                  </button>
+                </div>
+              ) : null}
               <button
                 type="button"
                 onClick={() => setProfileMenuOpen((prev) => !prev)}

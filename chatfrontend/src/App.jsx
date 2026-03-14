@@ -1,18 +1,33 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { io } from 'socket.io-client'
+import { Phone, PhoneOff, Video } from 'lucide-react'
 import AuthScreen from './components/chat/AuthScreen'
 import ChatSidebar from './components/chat/ChatSidebar'
 import ChatPanel from './components/chat/ChatPanel'
 import ProfileDrawer from './components/chat/ProfileDrawer'
 import ConfirmDialog from './components/chat/ConfirmDialog'
+import ZegoCallModal from './components/chat/ZegoCallModal'
 import './App.css'
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000'
+const runtimeHost = typeof window !== 'undefined' ? window.location.hostname : 'localhost'
+const API_URL = import.meta.env.VITE_API_URL || `http://${runtimeHost}:5000`
 const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || API_URL
-const UPLOAD_SERVER_URL = import.meta.env.VITE_UPLOAD_SERVER_URL || 'http://localhost:5001'
+const UPLOAD_SERVER_URL = import.meta.env.VITE_UPLOAD_SERVER_URL || `http://${runtimeHost}:5001`
 const UPLOAD_FILE_FIELD = import.meta.env.VITE_UPLOAD_FILE_FIELD || 'file'
 const CHAT_LIST_PAGE_SIZE = 30
 const MESSAGE_PAGE_SIZE = 40
+const ZEGO_APP_ID = Number(import.meta.env.VITE_ZEGO_APP_ID || 0)
+const ZEGO_SERVER_SECRET = import.meta.env.VITE_ZEGO_SERVER_SECRET || ''
+const ENABLE_WEB_PUSH = String(import.meta.env.VITE_ENABLE_WEB_PUSH || '1') !== '0'
+
+function urlBase64ToUint8Array(base64String) {
+  const padding = '='.repeat((4 - (base64String.length % 4)) % 4)
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/')
+  const rawData = window.atob(base64)
+  const outputArray = new Uint8Array(rawData.length)
+  for (let i = 0; i < rawData.length; i += 1) outputArray[i] = rawData.charCodeAt(i)
+  return outputArray
+}
 
 function App() {
   const [token, setToken] = useState(localStorage.getItem('chat_token') || '')
@@ -49,6 +64,9 @@ function App() {
   const [groupNameInput, setGroupNameInput] = useState('')
   const [groupMemberIds, setGroupMemberIds] = useState([])
   const [creatingGroup, setCreatingGroup] = useState(false)
+  const [incomingCall, setIncomingCall] = useState(null)
+  const [outgoingCall, setOutgoingCall] = useState(null)
+  const [activeCall, setActiveCall] = useState(null)
 
   const [loginForm, setLoginForm] = useState({ identifier: '', password: '' })
   const [registerForm, setRegisterForm] = useState({
@@ -64,6 +82,10 @@ function App() {
   const suppressAutoScrollRef = useRef(false)
   const seenRequestRef = useRef({})
   const groupSeenRequestRef = useRef({})
+  const serviceWorkerRegRef = useRef(null)
+  const ringtoneIntervalRef = useRef(null)
+  const ringtoneAudioContextRef = useRef(null)
+  const hasPushSubscribedRef = useRef(false)
 
   const activeConversationType = activeConversation?.type || null
   const activeChat = useMemo(() => {
@@ -139,7 +161,97 @@ function App() {
     return Array.from(map.values())
   }
 
+  const stopIncomingAlert = () => {
+    if (ringtoneIntervalRef.current) {
+      clearInterval(ringtoneIntervalRef.current)
+      ringtoneIntervalRef.current = null
+    }
+    if (navigator.vibrate) navigator.vibrate(0)
+    if (ringtoneAudioContextRef.current) {
+      ringtoneAudioContextRef.current.close().catch(() => null)
+      ringtoneAudioContextRef.current = null
+    }
+  }
+
+  const playIncomingAlert = () => {
+    stopIncomingAlert()
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext
+      if (!AudioCtx) return
+      const audioContext = new AudioCtx()
+      ringtoneAudioContextRef.current = audioContext
+      const playPulse = () => {
+        const now = audioContext.currentTime
+        const osc = audioContext.createOscillator()
+        const gainNode = audioContext.createGain()
+        osc.type = 'sine'
+        osc.frequency.setValueAtTime(880, now)
+        gainNode.gain.setValueAtTime(0.0001, now)
+        gainNode.gain.exponentialRampToValueAtTime(0.18, now + 0.02)
+        gainNode.gain.exponentialRampToValueAtTime(0.0001, now + 0.28)
+        osc.connect(gainNode)
+        gainNode.connect(audioContext.destination)
+        osc.start(now)
+        osc.stop(now + 0.32)
+      }
+
+      playPulse()
+      ringtoneIntervalRef.current = setInterval(playPulse, 1300)
+      if (navigator.vibrate) navigator.vibrate([250, 120, 250, 120])
+    } catch {
+      // ignore if autoplay policy blocks audio context
+    }
+  }
+
+  const ensureServiceWorker = async () => {
+    if (!ENABLE_WEB_PUSH) return null
+    if (!('serviceWorker' in navigator)) return null
+    if (serviceWorkerRegRef.current) return serviceWorkerRegRef.current
+    const reg = await navigator.serviceWorker.register('/sw.js')
+    serviceWorkerRegRef.current = reg
+    return reg
+  }
+
+  const ensurePushSubscription = async (authToken = token) => {
+    if (!ENABLE_WEB_PUSH || !authToken) return
+    if (!('Notification' in window) || !('serviceWorker' in navigator) || !('PushManager' in window)) return
+    if (hasPushSubscribedRef.current) return
+
+    const permission =
+      Notification.permission === 'granted'
+        ? 'granted'
+        : await Notification.requestPermission().catch(() => 'default')
+    if (permission !== 'granted') return
+
+    const registration = await ensureServiceWorker()
+    if (!registration) return
+
+    const vapid = await apiFetch('/api/notifications/vapid-public-key', {}, authToken).catch(() => null)
+    const publicKey = vapid?.publicKey
+    if (!publicKey) return
+
+    const existing = await registration.pushManager.getSubscription()
+    const subscription =
+      existing ||
+      (await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(publicKey),
+      }))
+
+    if (!subscription) return
+    await apiFetch(
+      '/api/notifications/subscribe',
+      {
+        method: 'POST',
+        body: JSON.stringify({ subscription: subscription.toJSON() }),
+      },
+      authToken,
+    ).catch(() => null)
+    hasPushSubscribedRef.current = true
+  }
+
   const clearAuthSession = (message = 'Session expired. Please login again.') => {
+    stopIncomingAlert()
     socketRef.current?.disconnect()
     socketRef.current = null
     localStorage.removeItem('chat_token')
@@ -157,6 +269,9 @@ function App() {
     setGroupPaginationById({})
     setActiveConversation(null)
     setError(message)
+    setIncomingCall(null)
+    setOutgoingCall(null)
+    setActiveCall(null)
   }
 
   const apiFetch = async (path, options = {}, authToken = token) => {
@@ -171,8 +286,10 @@ function App() {
     })
     const data = await res.json().catch(() => ({}))
     if (!res.ok) {
-      if (res.status === 401) clearAuthSession(data.message || 'Unauthorized')
-      throw new Error(data.message || 'Request failed')
+      if (res.status === 401 && authToken) clearAuthSession(data.message || 'Unauthorized')
+      const baseMessage = data.message || 'Request failed'
+      const details = data.error && data.error !== baseMessage ? `: ${data.error}` : ''
+      throw new Error(`${baseMessage}${details}`)
     }
     return data
   }
@@ -434,6 +551,38 @@ function App() {
   }
 
   useEffect(() => {
+    if (!outgoingCall) return
+    const timer = setTimeout(() => {
+      setOutgoingCall((prev) => {
+        if (!prev || prev.roomId !== outgoingCall.roomId) return prev
+        setError('No answer from other user')
+        return null
+      })
+    }, 45000)
+    return () => clearTimeout(timer)
+  }, [outgoingCall])
+
+  useEffect(() => {
+    if (!incomingCall) {
+      stopIncomingAlert()
+      return
+    }
+    playIncomingAlert()
+
+    if (document.visibilityState !== 'visible' && 'Notification' in window && Notification.permission === 'granted') {
+      new Notification(`${incomingCall.fromUser?.username || 'Unknown user'} is calling`, {
+        body: incomingCall.callType === 'audio' ? 'Incoming audio call' : 'Incoming video call',
+        tag: `incoming-${incomingCall.roomId}`,
+        renotify: true,
+      })
+    }
+
+    return () => {
+      stopIncomingAlert()
+    }
+  }, [incomingCall])
+
+  useEffect(() => {
     if (!token) return
     let mounted = true
     ;(async () => {
@@ -443,6 +592,7 @@ function App() {
         const me = await apiFetch('/api/auth/me', {}, token)
         if (!mounted) return
         setCurrentUser(me.user)
+        ensurePushSubscription(token).catch(() => null)
         const [fetchedUsers, fetchedGroups] = await Promise.all([
           fetchContacts(token, { page: 1, append: false }),
           fetchGroups(token, { page: 1, append: false }),
@@ -507,6 +657,43 @@ function App() {
           })
           setUsers((prev) => prev.map((u) => (u.id === withUserId ? { ...u, unreadCount: 0 } : u)))
         })
+        socket.on('call:incoming', (payload) => {
+          setIncomingCall(payload)
+          socket.emit('call:ringing', {
+            toUserId: payload?.fromUser?.id,
+            roomId: payload?.roomId,
+          })
+        })
+        socket.on('call:ringing', (payload) => {
+          setOutgoingCall((prev) => {
+            if (!prev || prev.roomId !== payload?.roomId) return prev
+            return { ...prev, status: 'ringing' }
+          })
+        })
+        socket.on('call:response', (payload) => {
+          if (payload?.accepted) {
+            setOutgoingCall((prev) => {
+              if (!prev || prev.roomId !== payload.roomId) return prev
+              setActiveCall({
+                roomId: prev.roomId,
+                callType: prev.callType,
+                status: 'connected',
+                peerUser: prev.peerUser,
+              })
+              return null
+            })
+            return
+          }
+          if (!payload?.accepted) {
+            setIncomingCall((prev) => (prev?.roomId === payload?.roomId ? null : prev))
+            setOutgoingCall((prev) => {
+              if (!prev || prev.roomId !== payload?.roomId) return prev
+              setError(`${payload?.byUser?.username || 'User'} declined the call`)
+              return null
+            })
+            setActiveCall(null)
+          }
+        })
         socketRef.current = socket
       } catch (e) {
         setError(e.message)
@@ -517,9 +704,15 @@ function App() {
     })()
     return () => {
       mounted = false
+      stopIncomingAlert()
       socketRef.current?.disconnect()
       socketRef.current = null
     }
+  }, [token])
+
+  useEffect(() => {
+    if (!token || !ENABLE_WEB_PUSH) return
+    ensureServiceWorker().catch(() => null)
   }, [token])
 
   useEffect(() => {
@@ -566,7 +759,11 @@ function App() {
     setSubmitting(true)
     setError('')
     try {
-      const data = await apiFetch('/api/auth/login', { method: 'POST', body: JSON.stringify(loginForm) }, '')
+      const payload = {
+        ...loginForm,
+        identifier: String(loginForm.identifier || '').trim(),
+      }
+      const data = await apiFetch('/api/auth/login', { method: 'POST', body: JSON.stringify(payload) }, '')
       localStorage.setItem('chat_token', data.token)
       setToken(data.token)
       setLoginForm({ identifier: '', password: '' })
@@ -857,6 +1054,62 @@ function App() {
     setConfirmAction(null)
   }
 
+  const startDirectCall = (callType = 'video') => {
+    if (activeConversationType !== 'direct' || !activeChat || !currentUser) return
+    const a = Number(currentUser.id)
+    const b = Number(activeChat.id)
+    const roomId = `call_${Math.min(a, b)}_${Math.max(a, b)}_${Date.now()}`
+    socketRef.current?.emit('call:invite', { toUserId: activeChat.id, roomId, callType }, (ack) => {
+      if (!ack?.ok) {
+        setError(ack?.message || 'Failed to start call')
+      }
+    })
+    setOutgoingCall({
+      roomId,
+      callType,
+      status: 'calling',
+      peerUser: { id: activeChat.id, username: activeChat.username, profileMediaUrl: activeChat.profileMediaUrl || null },
+    })
+  }
+
+  const acceptIncomingCall = () => {
+    if (!incomingCall) return
+    socketRef.current?.emit('call:response', {
+      toUserId: incomingCall.fromUser?.id,
+      roomId: incomingCall.roomId,
+      accepted: true,
+    })
+    setActiveCall({
+      roomId: incomingCall.roomId,
+      callType: incomingCall.callType || 'video',
+      status: 'connected',
+      peerUser: incomingCall.fromUser || null,
+    })
+    setOutgoingCall(null)
+    setIncomingCall(null)
+  }
+
+  const rejectIncomingCall = () => {
+    if (!incomingCall) return
+    socketRef.current?.emit('call:response', {
+      toUserId: incomingCall.fromUser?.id,
+      roomId: incomingCall.roomId,
+      accepted: false,
+    })
+    setIncomingCall(null)
+  }
+
+  const cancelOutgoingCall = () => {
+    if (outgoingCall?.peerUser?.id) {
+      socketRef.current?.emit('call:response', {
+        toUserId: outgoingCall.peerUser.id,
+        roomId: outgoingCall.roomId,
+        accepted: false,
+      })
+    }
+    setOutgoingCall(null)
+  }
+
   if (!token) {
     return (
       <AuthScreen
@@ -924,6 +1177,8 @@ function App() {
           openProfile={() => {
             if (activeConversationType !== 'group') setIsProfileOpen(true)
           }}
+          startAudioCall={() => startDirectCall('audio')}
+          startVideoCall={() => startDirectCall('video')}
           getInitials={getInitials}
           profileMenuOpen={profileMenuOpen}
           setProfileMenuOpen={setProfileMenuOpen}
@@ -975,6 +1230,115 @@ function App() {
         />
 
         <ConfirmDialog confirmAction={confirmAction} setConfirmAction={setConfirmAction} runConfirmAction={runConfirmAction} />
+
+        {outgoingCall ? (
+          <div className="absolute inset-0 z-50 overflow-hidden bg-[#0b141a]">
+            <div className="absolute inset-0 bg-gradient-to-b from-[#1f2c34] via-[#0f1a20] to-[#0b141a]" />
+            <div className="absolute inset-0 bg-[radial-gradient(circle_at_20%_25%,rgba(37,211,102,0.22),transparent_38%),radial-gradient(circle_at_82%_75%,rgba(0,168,132,0.18),transparent_42%)]" />
+            <div className="relative z-10 flex h-full flex-col items-center justify-between px-6 pb-12 pt-14">
+              <div className="text-center">
+                <p className="text-xs uppercase tracking-[0.18em] text-[#d1d7db]">
+                  {outgoingCall.status === 'ringing' ? 'Ringing...' : 'Calling...'}
+                </p>
+                <div className="mx-auto mt-6 flex h-28 w-28 items-center justify-center overflow-hidden rounded-full border-4 border-white/25 bg-[#233138] text-3xl font-semibold text-[#d9fdd3]">
+                  {outgoingCall.peerUser?.profileMediaUrl ? (
+                    <img
+                      src={outgoingCall.peerUser.profileMediaUrl}
+                      alt={outgoingCall.peerUser?.username || 'User'}
+                      className="h-full w-full object-cover"
+                    />
+                  ) : (
+                    String(outgoingCall.peerUser?.username || 'U').slice(0, 1).toUpperCase()
+                  )}
+                </div>
+                <p className="mt-4 text-2xl font-semibold text-white">{outgoingCall.peerUser?.username || 'User'}</p>
+                <p className="mt-1 text-sm text-[#d1d7db]">
+                  {outgoingCall.callType === 'audio' ? 'Audio call' : 'Video call'}
+                </p>
+                <div className="mt-4 inline-flex items-center gap-2 rounded-full border border-white/20 bg-black/25 px-3 py-1.5 text-xs text-[#d1d7db]">
+                  <span className="h-2 w-2 animate-pulse rounded-full bg-[#ffbf47]" />
+                  <span>
+                    {outgoingCall.status === 'ringing'
+                      ? 'Other side phone is ringing'
+                      : 'Sending call request'}
+                  </span>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={cancelOutgoingCall}
+                className="group flex flex-col items-center gap-3 text-white"
+              >
+                <span className="flex h-16 w-16 items-center justify-center rounded-full bg-[#f15c6d] shadow-lg transition group-hover:scale-105">
+                  <PhoneOff size={28} />
+                </span>
+                <span className="text-sm text-[#d1d7db]">End</span>
+              </button>
+            </div>
+          </div>
+        ) : null}
+
+        {incomingCall ? (
+          <div className="absolute inset-0 z-50 overflow-hidden bg-[#0b141a]">
+            <div className="absolute inset-0 bg-gradient-to-b from-[#1f2c34] via-[#0f1a20] to-[#0b141a]" />
+            <div className="absolute inset-0 bg-[radial-gradient(circle_at_25%_20%,rgba(37,211,102,0.2),transparent_38%),radial-gradient(circle_at_80%_70%,rgba(0,168,132,0.18),transparent_42%)]" />
+            <div className="relative z-10 flex h-full flex-col items-center justify-between px-6 pb-10 pt-14">
+              <div className="text-center">
+                <p className="text-xs uppercase tracking-[0.18em] text-[#d1d7db]">Incoming {incomingCall.callType || 'video'} call</p>
+                <div className="mx-auto mt-6 flex h-28 w-28 items-center justify-center overflow-hidden rounded-full border-4 border-white/25 bg-[#233138] text-3xl font-semibold text-[#d9fdd3]">
+                  {incomingCall.fromUser?.profileMediaUrl ? (
+                    <img
+                      src={incomingCall.fromUser.profileMediaUrl}
+                      alt={incomingCall.fromUser?.username || 'Unknown user'}
+                      className="h-full w-full object-cover"
+                    />
+                  ) : (
+                    String(incomingCall.fromUser?.username || 'U').slice(0, 1).toUpperCase()
+                  )}
+                </div>
+                <p className="mt-4 text-2xl font-semibold text-white">{incomingCall.fromUser?.username || 'Unknown user'}</p>
+                <p className="mt-1 text-sm text-[#d1d7db]">Tap to answer</p>
+              </div>
+
+              <div className="mb-2 flex w-full max-w-xs items-center justify-between">
+                <button
+                  type="button"
+                  onClick={rejectIncomingCall}
+                  className="group flex flex-col items-center gap-3 text-white"
+                >
+                  <span className="flex h-16 w-16 items-center justify-center rounded-full bg-[#f15c6d] shadow-lg transition group-hover:scale-105">
+                    <PhoneOff size={28} />
+                  </span>
+                  <span className="text-sm text-[#d1d7db]">Decline</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={acceptIncomingCall}
+                  className="group flex flex-col items-center gap-3 text-white"
+                >
+                  <span className="flex h-16 w-16 items-center justify-center rounded-full bg-[#25d366] shadow-lg transition group-hover:scale-105">
+                    {String(incomingCall.callType || 'video') === 'audio' ? <Phone size={28} /> : <Video size={28} />}
+                  </span>
+                  <span className="text-sm text-[#d1d7db]">Accept</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+        <ZegoCallModal
+          open={Boolean(activeCall && activeCall.status === 'connected')}
+          onClose={() => setActiveCall(null)}
+          appId={ZEGO_APP_ID}
+          serverSecret={ZEGO_SERVER_SECRET}
+          roomId={activeCall?.roomId || ''}
+          userId={String(currentUser?.id || '')}
+          userName={currentUser?.username || 'User'}
+          callType={activeCall?.callType || 'video'}
+          peerUser={activeCall?.peerUser || null}
+          callStatus={activeCall?.status || 'connecting'}
+        />
 
         {isCreateGroupOpen ? (
           <div className="absolute inset-0 z-40 grid place-items-center bg-black/35 p-4">

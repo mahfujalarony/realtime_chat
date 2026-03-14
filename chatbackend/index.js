@@ -6,21 +6,39 @@ const cors = require('cors')
 const jwt = require('jsonwebtoken')
 const { DataTypes } = require('sequelize')
 const { Server } = require('socket.io')
-const { sequelize, User, Message, Contact, GroupMember, GroupMessage } = require('./models')
+const { sequelize, User, Message, Contact, GroupMember, GroupMessage, PushSubscription } = require('./models')
 const authRoutes = require('./routes/auth.routes')
 const userRoutes = require('./routes/users.routes')
 const messageRoutes = require('./routes/messages.routes')
 const groupRoutes = require('./routes/groups.routes')
+const notificationsRoutes = require('./routes/notifications.routes')
 const { ensureUserUniqueUsername } = require('./utils/user-identity')
+const { sendPushNotification, isPushEnabled } = require('./utils/push')
 
 const app = express()
 const server = http.createServer(app)
 const port = Number(process.env.PORT || 5000)
-const corsOrigin = process.env.CORS_ORIGIN || '*'
+const rawCorsOrigin = process.env.CORS_ORIGIN || '*'
+const corsOrigins = rawCorsOrigin
+  .split(',')
+  .map((item) => item.trim())
+  .filter(Boolean)
+const allowAllOrigins = corsOrigins.includes('*')
+
+function isOriginAllowed(origin) {
+  if (!origin) return true
+  if (allowAllOrigins) return true
+  return corsOrigins.includes(origin)
+}
 
 app.use(
   cors({
-    origin: corsOrigin,
+    origin(origin, callback) {
+      if (isOriginAllowed(origin)) {
+        return callback(null, true)
+      }
+      return callback(new Error('Not allowed by CORS'))
+    },
     credentials: true,
   }),
 )
@@ -28,7 +46,12 @@ app.use(express.json())
 
 const io = new Server(server, {
   cors: {
-    origin: corsOrigin,
+    origin(origin, callback) {
+      if (isOriginAllowed(origin)) {
+        return callback(null, true)
+      }
+      return callback(new Error('Not allowed by CORS'))
+    },
     credentials: true,
   },
 })
@@ -36,6 +59,47 @@ const io = new Server(server, {
 app.set('io', io)
 const onlineUserSockets = new Map()
 app.set('onlineUserSockets', onlineUserSockets)
+const APP_PUBLIC_URL = process.env.APP_PUBLIC_URL || 'http://localhost:5173'
+
+async function sendIncomingCallPush(toUserId, payload) {
+  if (!isPushEnabled()) return
+  const subscriptions = await PushSubscription.findAll({
+    where: { userId: toUserId },
+    attributes: ['id', 'endpoint', 'p256dh', 'auth'],
+    raw: true,
+  })
+  if (!subscriptions.length) return
+
+  const pushPayload = {
+    type: 'incoming_call',
+    title: `${payload.fromUser.username} is calling`,
+    body: payload.callType === 'audio' ? 'Incoming audio call' : 'Incoming video call',
+    roomId: payload.roomId,
+    callType: payload.callType,
+    fromUser: payload.fromUser,
+    url: `${APP_PUBLIC_URL}/?incomingCall=1&roomId=${encodeURIComponent(payload.roomId)}`,
+    ts: Date.now(),
+  }
+
+  await Promise.all(
+    subscriptions.map(async (item) => {
+      try {
+        await sendPushNotification(
+          {
+            endpoint: item.endpoint,
+            keys: { p256dh: item.p256dh, auth: item.auth },
+          },
+          pushPayload,
+        )
+      } catch (error) {
+        const statusCode = Number(error?.statusCode)
+        if (statusCode === 404 || statusCode === 410) {
+          await PushSubscription.destroy({ where: { id: item.id } }).catch(() => null)
+        }
+      }
+    }),
+  )
+}
 
 app.get('/api/health', (req, res) => {
   res.json({ ok: true, service: 'chatbackend' })
@@ -45,6 +109,7 @@ app.use('/api/auth', authRoutes)
 app.use('/api/users', userRoutes)
 app.use('/api/messages', messageRoutes)
 app.use('/api/groups', groupRoutes)
+app.use('/api/notifications', notificationsRoutes)
 
 io.use(async (socket, next) => {
   try {
@@ -182,6 +247,71 @@ io.on('connection', (socket) => {
     } catch (error) {
       if (typeof ack === 'function') ack({ ok: false, message: 'Failed to send group message' })
     }
+  })
+
+  socket.on('call:invite', async (payload, ack) => {
+    try {
+      const toUserId = Number(payload?.toUserId)
+      const roomId = String(payload?.roomId || '').trim()
+      const callType = String(payload?.callType || 'video').toLowerCase() === 'audio' ? 'audio' : 'video'
+      if (!Number.isInteger(toUserId) || !roomId) {
+        if (typeof ack === 'function') ack({ ok: false, message: 'Invalid payload' })
+        return
+      }
+
+      const toUser = await User.findByPk(toUserId)
+      if (!toUser) {
+        if (typeof ack === 'function') ack({ ok: false, message: 'User not found' })
+        return
+      }
+
+      const contact = await Contact.findOne({ where: { userId: currentUserId, contactUserId: toUserId } })
+      if (!contact) {
+        if (typeof ack === 'function') ack({ ok: false, message: 'Add this user to contacts first' })
+        return
+      }
+
+      const invitePayload = {
+        roomId,
+        callType,
+        fromUser: {
+          id: socket.user.id,
+          username: socket.user.username,
+          uniqueUsername: socket.user.uniqueUsername,
+          profileMediaUrl: socket.user.profileMediaUrl,
+        },
+      }
+      io.to(`user:${toUserId}`).emit('call:incoming', invitePayload)
+      sendIncomingCallPush(toUserId, invitePayload).catch(() => null)
+      if (typeof ack === 'function') ack({ ok: true })
+    } catch (error) {
+      if (typeof ack === 'function') ack({ ok: false, message: 'Failed to send invite' })
+    }
+  })
+
+  socket.on('call:ringing', (payload) => {
+    const toUserId = Number(payload?.toUserId)
+    if (!Number.isInteger(toUserId)) return
+    io.to(`user:${toUserId}`).emit('call:ringing', {
+      roomId: String(payload?.roomId || ''),
+      byUser: {
+        id: socket.user.id,
+        username: socket.user.username,
+      },
+    })
+  })
+
+  socket.on('call:response', (payload) => {
+    const toUserId = Number(payload?.toUserId)
+    if (!Number.isInteger(toUserId)) return
+    io.to(`user:${toUserId}`).emit('call:response', {
+      roomId: String(payload?.roomId || ''),
+      accepted: Boolean(payload?.accepted),
+      byUser: {
+        id: socket.user.id,
+        username: socket.user.username,
+      },
+    })
   })
 
   socket.on('disconnect', async () => {

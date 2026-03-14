@@ -271,10 +271,8 @@ function send(res, files) {
     JSON.stringify({
       success: true,
       urls: files.map((f) => {
-        const normalized = String(f || "")
-          .replace(/\\/g, "/")
-          .replace(/^\.?\//, "");
-        return `${config.BASE_URL}/${normalized}`;
+        const normalized = String(f || "").replace(/\\/g, "/").replace(/^\.?\//, "");
+        return `/${normalized}`;
       }),
     })
   );
