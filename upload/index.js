@@ -159,6 +159,7 @@ const server = http.createServer(async (req, res) => {
       fs.mkdirSync(path.join(basePath, "videos"), { recursive: true });
       fs.mkdirSync(path.join(basePath, "audios"), { recursive: true });
       fs.mkdirSync(path.join(basePath, "files"), { recursive: true });
+      fs.mkdirSync(path.join(basePath, "profile"), { recursive: true });
 
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(
@@ -171,11 +172,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     /* upload media to user's chat folder */
-    /* Routes: /upload/chat/:username/images|videos|audios|files */
-    const chatUploadMatch = req.url.match(/^\/upload\/chat\/([^/?]+)\/(images|videos|audios|files)/);
+    /* Routes: /upload/chat/:username/images|videos|audios|files|profile */
+    const chatUploadMatch = req.url.match(/^\/upload\/chat\/([^/?]+)\/(images|videos|audios|files|profile)/);
     if (req.method === "POST" && chatUploadMatch) {
       const username = decodeURIComponent(chatUploadMatch[1]);
-      const mediaType = chatUploadMatch[2]; // 'images', 'videos', 'audios', or 'files'
+      const mediaType = chatUploadMatch[2];
 
       if (!username) {
         res.writeHead(400, { "Content-Type": "application/json" });
@@ -206,6 +207,10 @@ const server = http.createServer(async (req, res) => {
           allowedTypes = config.ALLOWED_FILES;
           maxSize = config.LIMITS.FILE;
           break;
+        case "profile":
+          allowedTypes = config.ALLOWED_IMAGES;
+          maxSize = config.LIMITS.IMAGE;
+          break;
         default:
           allowedTypes = config.ALLOWED_IMAGES;
           maxSize = config.LIMITS.IMAGE;
@@ -222,7 +227,7 @@ const server = http.createServer(async (req, res) => {
 
     /* DELETE file from chat folder */
     /* Route: DELETE /delete/chat/:username/:mediaType/:filename */
-    const deleteMatch = req.url.match(/^\/delete\/chat\/([^/?]+)\/(images|videos|audios|files)\/([^/?]+)/);
+    const deleteMatch = req.url.match(/^\/delete\/chat\/([^/?]+)\/(images|videos|audios|files|profile)\/([^/?]+)/);
     if (req.method === "DELETE" && deleteMatch) {
       const username = decodeURIComponent(deleteMatch[1]);
       const mediaType = deleteMatch[2];

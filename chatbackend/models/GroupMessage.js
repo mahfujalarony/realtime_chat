@@ -1,17 +1,17 @@
 module.exports = (sequelize, DataTypes) => {
-  const Message = sequelize.define(
-    'Message',
+  const GroupMessage = sequelize.define(
+    'GroupMessage',
     {
       id: {
         type: DataTypes.INTEGER,
         primaryKey: true,
         autoIncrement: true,
       },
-      senderId: {
+      groupId: {
         type: DataTypes.INTEGER,
         allowNull: false,
       },
-      receiverId: {
+      senderId: {
         type: DataTypes.INTEGER,
         allowNull: false,
       },
@@ -47,22 +47,17 @@ module.exports = (sequelize, DataTypes) => {
           min: 0,
         },
       },
-      seen: {
-        type: DataTypes.BOOLEAN,
-        allowNull: false,
-        defaultValue: false,
-      },
     },
     {
-      tableName: 'messages',
+      tableName: 'group_messages',
       underscored: true,
       indexes: [
+        { fields: ['group_id'] },
         { fields: ['sender_id'] },
-        { fields: ['receiver_id'] },
         { fields: ['created_at'] },
       ],
     },
   )
 
-  return Message
+  return GroupMessage
 }

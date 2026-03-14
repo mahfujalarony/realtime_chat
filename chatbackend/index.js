@@ -6,10 +6,12 @@ const cors = require('cors')
 const jwt = require('jsonwebtoken')
 const { DataTypes } = require('sequelize')
 const { Server } = require('socket.io')
-const { sequelize, User, Message, Contact } = require('./models')
+const { sequelize, User, Message, Contact, GroupMember, GroupMessage } = require('./models')
 const authRoutes = require('./routes/auth.routes')
 const userRoutes = require('./routes/users.routes')
 const messageRoutes = require('./routes/messages.routes')
+const groupRoutes = require('./routes/groups.routes')
+const { ensureUserUniqueUsername } = require('./utils/user-identity')
 
 const app = express()
 const server = http.createServer(app)
@@ -32,6 +34,8 @@ const io = new Server(server, {
 })
 
 app.set('io', io)
+const onlineUserSockets = new Map()
+app.set('onlineUserSockets', onlineUserSockets)
 
 app.get('/api/health', (req, res) => {
   res.json({ ok: true, service: 'chatbackend' })
@@ -40,6 +44,7 @@ app.get('/api/health', (req, res) => {
 app.use('/api/auth', authRoutes)
 app.use('/api/users', userRoutes)
 app.use('/api/messages', messageRoutes)
+app.use('/api/groups', groupRoutes)
 
 io.use(async (socket, next) => {
   try {
@@ -58,6 +63,7 @@ io.use(async (socket, next) => {
       return next(new Error('Unauthorized: user not found'))
     }
 
+    await ensureUserUniqueUsername(user, User)
     socket.user = user
     return next()
   } catch (error) {
@@ -68,6 +74,22 @@ io.use(async (socket, next) => {
 io.on('connection', (socket) => {
   const currentUserId = socket.user.id
   socket.join(`user:${currentUserId}`)
+  const existingSockets = onlineUserSockets.get(currentUserId) || 0
+  onlineUserSockets.set(currentUserId, existingSockets + 1)
+
+  if (existingSockets === 0) {
+    io.emit('chat:presence', { userId: currentUserId, isOnline: true, lastSeen: socket.user.lastSeen })
+  }
+
+  GroupMember.findAll({
+    where: { userId: currentUserId },
+    attributes: ['groupId'],
+    raw: true,
+  })
+    .then((memberships) => {
+      memberships.forEach((item) => socket.join(`group:${item.groupId}`))
+    })
+    .catch(() => null)
 
   socket.on('chat:send', async (payload, ack) => {
     try {
@@ -120,10 +142,59 @@ io.on('connection', (socket) => {
     }
   })
 
+  socket.on('chat:group-send', async (payload, ack) => {
+    try {
+      const groupId = Number(payload?.groupId)
+      const text = (payload?.text || '').trim()
+      if (!Number.isInteger(groupId) || !text) {
+        if (typeof ack === 'function') ack({ ok: false, message: 'Invalid payload' })
+        return
+      }
+
+      const membership = await GroupMember.findOne({ where: { groupId, userId: currentUserId } })
+      if (!membership) {
+        if (typeof ack === 'function') ack({ ok: false, message: 'You are not a member of this group' })
+        return
+      }
+
+      const message = await GroupMessage.create({
+        groupId,
+        senderId: currentUserId,
+        text,
+        messageType: 'text',
+      })
+      const messagePayload = {
+        id: message.id,
+        groupId: message.groupId,
+        senderId: message.senderId,
+        text: message.text,
+        messageType: message.messageType,
+        mediaUrl: message.mediaUrl,
+        mediaMimeType: message.mediaMimeType,
+        mediaOriginalName: message.mediaOriginalName,
+        mediaDurationSec: message.mediaDurationSec,
+        createdAt: message.createdAt,
+      }
+
+      await GroupMember.update({ lastReadAt: new Date() }, { where: { groupId, userId: currentUserId } })
+      io.to(`group:${groupId}`).emit('chat:group-message', messagePayload)
+      if (typeof ack === 'function') ack({ ok: true, message: messagePayload })
+    } catch (error) {
+      if (typeof ack === 'function') ack({ ok: false, message: 'Failed to send group message' })
+    }
+  })
+
   socket.on('disconnect', async () => {
     try {
-      socket.user.lastSeen = new Date()
-      await socket.user.save()
+      const currentCount = onlineUserSockets.get(currentUserId) || 0
+      if (currentCount <= 1) {
+        onlineUserSockets.delete(currentUserId)
+        socket.user.lastSeen = new Date()
+        await socket.user.save()
+        io.emit('chat:presence', { userId: currentUserId, isOnline: false, lastSeen: socket.user.lastSeen })
+      } else {
+        onlineUserSockets.set(currentUserId, currentCount - 1)
+      }
     } catch (error) {
       // no-op
     }
@@ -150,11 +221,41 @@ async function start() {
     }
     const queryInterface = sequelize.getQueryInterface()
     const messagesTable = await queryInterface.describeTable('messages').catch(() => null)
+    const usersTable = await queryInterface.describeTable('users').catch(() => null)
+    const groupMessagesTable = await queryInterface.describeTable('group_messages').catch(() => null)
     if (messagesTable && !messagesTable.media_duration_sec) {
       await queryInterface.addColumn('messages', 'media_duration_sec', {
         type: DataTypes.INTEGER,
         allowNull: true,
       })
+    }
+    if (messagesTable && !messagesTable.media_group_id) {
+      await queryInterface.addColumn('messages', 'media_group_id', {
+        type: DataTypes.STRING(80),
+        allowNull: true,
+      })
+    }
+    if (groupMessagesTable && !groupMessagesTable.media_group_id) {
+      await queryInterface.addColumn('group_messages', 'media_group_id', {
+        type: DataTypes.STRING(80),
+        allowNull: true,
+      })
+    }
+    if (usersTable && !usersTable.unique_username) {
+      await queryInterface.addColumn('users', 'unique_username', {
+        type: DataTypes.STRING(120),
+        allowNull: true,
+        unique: true,
+      })
+    }
+    const userIndexes = await queryInterface.showIndex('users').catch(() => [])
+    const usernameUniqueIndexes = userIndexes.filter((idx) => {
+      if (!idx.unique || idx.primary) return false
+      const fieldNames = (idx.fields || []).map((f) => f.attribute || f.name).filter(Boolean)
+      return fieldNames.length === 1 && fieldNames[0] === 'username'
+    })
+    for (const idx of usernameUniqueIndexes) {
+      await queryInterface.removeIndex('users', idx.name).catch(() => null)
     }
     console.log(`Database sync mode: ${dbSyncMode}`)
     server.listen(port, () => {

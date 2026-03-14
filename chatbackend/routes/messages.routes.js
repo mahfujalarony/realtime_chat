@@ -5,11 +5,11 @@ const { Message, User, Contact } = require('../models')
 
 const router = express.Router()
 
-function isSenderMediaUrlValid(mediaUrl, username, messageType) {
+function isSenderMediaUrlValid(mediaUrl, uniqueUsername, messageType) {
   try {
     const parsed = new URL(mediaUrl)
     const pathname = decodeURIComponent(parsed.pathname).toLowerCase()
-    const userPath = `/chat/${String(username).toLowerCase()}/`
+    const userPath = `/chat/${String(uniqueUsername).toLowerCase()}/`
     if (!pathname.includes(userPath)) return false
 
     if (messageType === 'image') {
@@ -40,6 +40,7 @@ function formatMessage(message) {
     mediaUrl: message.mediaUrl,
     mediaMimeType: message.mediaMimeType,
     mediaOriginalName: message.mediaOriginalName,
+    mediaGroupId: message.mediaGroupId,
     mediaDurationSec: message.mediaDurationSec,
     seen: message.seen,
     createdAt: message.createdAt,
@@ -85,6 +86,60 @@ router.get('/:userId', authMiddleware, async (req, res) => {
   }
 })
 
+router.post('/:userId/seen', authMiddleware, async (req, res) => {
+  try {
+    const otherUserId = Number(req.params.userId)
+    if (!Number.isInteger(otherUserId)) {
+      return res.status(400).json({ message: 'Invalid userId' })
+    }
+
+    const contact = await ensureContact(req.user.id, otherUserId)
+    if (!contact) {
+      return res.status(403).json({ message: 'Add this user to contacts first' })
+    }
+
+    const unseenMessages = await Message.findAll({
+      where: {
+        senderId: otherUserId,
+        receiverId: req.user.id,
+        seen: false,
+      },
+      attributes: ['id'],
+      raw: true,
+    })
+    const seenMessageIds = unseenMessages.map((item) => item.id)
+
+    if (seenMessageIds.length > 0) {
+      await Message.update(
+        { seen: true },
+        {
+          where: {
+            id: { [Op.in]: seenMessageIds },
+          },
+        },
+      )
+
+      const io = req.app.get('io')
+      // Receiver's conversation key is sender (otherUserId),
+      // sender's conversation key is receiver (req.user.id).
+      io.to(`user:${req.user.id}`).emit('chat:messages-seen', {
+        byUserId: req.user.id,
+        withUserId: otherUserId,
+        messageIds: seenMessageIds,
+      })
+      io.to(`user:${otherUserId}`).emit('chat:messages-seen', {
+        byUserId: req.user.id,
+        withUserId: req.user.id,
+        messageIds: seenMessageIds,
+      })
+    }
+
+    return res.json({ seenCount: seenMessageIds.length, messageIds: seenMessageIds })
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to mark messages as seen', error: error.message })
+  }
+})
+
 router.post('/:userId', authMiddleware, async (req, res) => {
   try {
     const otherUserId = Number(req.params.userId)
@@ -93,6 +148,8 @@ router.post('/:userId', authMiddleware, async (req, res) => {
     const messageType = (req.body.messageType || 'text').trim().toLowerCase()
     const mediaMimeType = (req.body.mediaMimeType || '').trim()
     const mediaOriginalName = (req.body.mediaOriginalName || '').trim()
+    const mediaGroupIdRaw = req.body.mediaGroupId
+    const mediaGroupId = typeof mediaGroupIdRaw === 'string' ? mediaGroupIdRaw.trim().slice(0, 80) : null
     const rawDuration = req.body.mediaDurationSec
     const mediaDurationSec = rawDuration !== null && rawDuration !== undefined && Number.isFinite(Number(rawDuration))
       ? Math.max(0, Math.floor(Number(rawDuration)))
@@ -116,9 +173,12 @@ router.post('/:userId', authMiddleware, async (req, res) => {
     if (mediaDurationSec !== null && mediaDurationSec > 60 * 60) {
       return res.status(400).json({ message: 'mediaDurationSec is too large' })
     }
-    if (mediaUrl && !isSenderMediaUrlValid(mediaUrl, req.user.username, messageType)) {
+    if (mediaGroupId && !/^[a-zA-Z0-9_-]{4,80}$/.test(mediaGroupId)) {
+      return res.status(400).json({ message: 'Invalid mediaGroupId format' })
+    }
+    if (mediaUrl && !isSenderMediaUrlValid(mediaUrl, req.user.uniqueUsername || req.user.username, messageType)) {
       return res.status(400).json({
-        message: 'Invalid media URL path. It must be inside your chat/<username>/images, videos, audios, or files folder',
+        message: 'Invalid media URL path. It must be inside your chat/<uniqueUsername>/images, videos, audios, or files folder',
       })
     }
 
@@ -139,6 +199,7 @@ router.post('/:userId', authMiddleware, async (req, res) => {
       mediaUrl: mediaUrl || null,
       mediaMimeType: mediaMimeType || null,
       mediaOriginalName: mediaOriginalName || null,
+      mediaGroupId: mediaGroupId || null,
       mediaDurationSec: messageType === 'audio' ? mediaDurationSec : null,
     })
 

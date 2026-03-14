@@ -1,6 +1,6 @@
 const UPLOAD_SERVER_URL = process.env.UPLOAD_SERVER_URL || 'http://localhost:5001'
 
-async function ensureUserFolder(username) {
+async function ensureUserFolder(uniqueUsername) {
   if (!UPLOAD_SERVER_URL) {
     return { skipped: true }
   }
@@ -10,8 +10,8 @@ async function ensureUserFolder(username) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      username,
-      targetPath: `chat/${username}`,
+      username: uniqueUsername,
+      targetPath: `chat/${uniqueUsername}`,
     }),
   })
 
@@ -23,10 +23,9 @@ async function ensureUserFolder(username) {
   return response.json().catch(() => ({}))
 }
 
-function getUploadUrl(username, mediaType = 'images') {
+function getUploadUrl(uniqueUsername, mediaType = 'images') {
   if (!UPLOAD_SERVER_URL) return null
-  // mediaType: 'images' or 'videos'
-  return `${UPLOAD_SERVER_URL}/upload/chat/${encodeURIComponent(username)}/${mediaType}`
+  return `${UPLOAD_SERVER_URL}/upload/chat/${encodeURIComponent(uniqueUsername)}/${mediaType}`
 }
 
 module.exports = {

@@ -1,5 +1,6 @@
 const jwt = require('jsonwebtoken')
 const { User } = require('../models')
+const { ensureUserUniqueUsername } = require('../utils/user-identity')
 
 async function authMiddleware(req, res, next) {
   try {
@@ -17,6 +18,7 @@ async function authMiddleware(req, res, next) {
       return res.status(401).json({ message: 'Unauthorized: user not found' })
     }
 
+    await ensureUserUniqueUsername(user, User)
     req.user = user
     next()
   } catch (error) {

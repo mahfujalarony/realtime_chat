@@ -12,30 +12,15 @@ const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || API_URL
 const UPLOAD_SERVER_URL = import.meta.env.VITE_UPLOAD_SERVER_URL || 'http://localhost:5001'
 const UPLOAD_FILE_FIELD = import.meta.env.VITE_UPLOAD_FILE_FIELD || 'file'
 
-async function deleteMediaFromUploadServer(mediaUrl) {
-  if (!mediaUrl) return
-  try {
-    const parsed = new URL(mediaUrl)
-    const pathname = decodeURIComponent(parsed.pathname)
-    const match = pathname.match(/\/uploads\/chat\/([^/]+)\/(images|videos|audios|files)\/([^/]+)$/)
-    if (!match) return
-    const [, username, mediaType, filename] = match
-    const deleteUrl = `${UPLOAD_SERVER_URL}/delete/chat/${encodeURIComponent(username)}/${mediaType}/${encodeURIComponent(filename)}`
-    await fetch(deleteUrl, { method: 'DELETE' })
-  } catch (error) {
-    console.error('Failed to delete media:', error.message)
-  }
-}
-
 function App() {
   const [token, setToken] = useState(localStorage.getItem('chat_token') || '')
   const [currentUser, setCurrentUser] = useState(null)
   const [users, setUsers] = useState([])
-  const [searchQuery, setSearchQuery] = useState('')
+  const [groups, setGroups] = useState([])
   const [messagesByUser, setMessagesByUser] = useState({})
-  const [activeChatId, setActiveChatId] = useState(null)
-  const [isMobileChatOpen, setIsMobileChatOpen] = useState(false)
-  const [isProfileOpen, setIsProfileOpen] = useState(false)
+  const [groupMessagesById, setGroupMessagesById] = useState({})
+  const [activeConversation, setActiveConversation] = useState(null)
+  const [searchQuery, setSearchQuery] = useState('')
   const [draftMessage, setDraftMessage] = useState('')
   const [contactIdentifier, setContactIdentifier] = useState('')
   const [addingContact, setAddingContact] = useState(false)
@@ -43,16 +28,20 @@ function App() {
   const [submitting, setSubmitting] = useState(false)
   const [loadingApp, setLoadingApp] = useState(false)
   const [error, setError] = useState('')
+  const [isMobileChatOpen, setIsMobileChatOpen] = useState(false)
+  const [isProfileOpen, setIsProfileOpen] = useState(false)
   const [profileMenuOpen, setProfileMenuOpen] = useState(false)
   const [confirmAction, setConfirmAction] = useState(null)
   const [uploadingMedia, setUploadingMedia] = useState(false)
+  const [pendingMedia, setPendingMedia] = useState([])
   const [uploadingProfile, setUploadingProfile] = useState(false)
+  const [registerProfileFile, setRegisterProfileFile] = useState(null)
+  const [isCreateGroupOpen, setIsCreateGroupOpen] = useState(false)
+  const [groupNameInput, setGroupNameInput] = useState('')
+  const [groupMemberIds, setGroupMemberIds] = useState([])
+  const [creatingGroup, setCreatingGroup] = useState(false)
 
-  const [loginForm, setLoginForm] = useState({
-    identifier: '',
-    password: '',
-  })
-
+  const [loginForm, setLoginForm] = useState({ identifier: '', password: '' })
   const [registerForm, setRegisterForm] = useState({
     username: '',
     email: '',
@@ -63,22 +52,61 @@ function App() {
 
   const socketRef = useRef(null)
   const messageListRef = useRef(null)
+  const seenRequestRef = useRef({})
+  const groupSeenRequestRef = useRef({})
+
+  const activeConversationType = activeConversation?.type || null
+  const activeChat = useMemo(() => {
+    if (!activeConversation) return null
+    if (activeConversation.type === 'group') return groups.find((g) => g.id === activeConversation.id) || null
+    return users.find((u) => u.id === activeConversation.id) || null
+  }, [activeConversation, groups, users])
+
+  const activeMessages = useMemo(() => {
+    if (!activeConversation) return []
+    return activeConversation.type === 'group'
+      ? groupMessagesById[String(activeConversation.id)] || []
+      : messagesByUser[String(activeConversation.id)] || []
+  }, [activeConversation, groupMessagesById, messagesByUser])
+
+  const groupMemberNames = useMemo(() => {
+    if (activeConversationType !== 'group' || !activeChat?.members) return {}
+    return activeChat.members.reduce((acc, member) => {
+      acc[member.id] = member.username
+      return acc
+    }, {})
+  }, [activeChat, activeConversationType])
+
+  const replaceTempWithServerMessage = (list, tempId, serverMessage) => {
+    const hasServer = list.some((m) => m.id === serverMessage?.id)
+    return list
+      .map((m) => {
+        if (m.id !== tempId) return m
+        return hasServer ? null : serverMessage
+      })
+      .filter(Boolean)
+  }
+
+  const clearPendingMedia = () => {
+    setPendingMedia((prev) => {
+      prev.forEach((item) => {
+        if (item.previewUrl) URL.revokeObjectURL(item.previewUrl)
+      })
+      return []
+    })
+  }
 
   const clearAuthSession = (message = 'Session expired. Please login again.') => {
-    if (socketRef.current) {
-      socketRef.current.disconnect()
-      socketRef.current = null
-    }
+    socketRef.current?.disconnect()
+    socketRef.current = null
     localStorage.removeItem('chat_token')
     setToken('')
     setCurrentUser(null)
     setUsers([])
+    setGroups([])
     setMessagesByUser({})
-    setActiveChatId(null)
-    setIsMobileChatOpen(false)
-    setDraftMessage('')
-    setProfileMenuOpen(false)
-    setConfirmAction(null)
+    setGroupMessagesById({})
+    setActiveConversation(null)
     setError(message)
   }
 
@@ -92,14 +120,10 @@ function App() {
         ...(options.headers || {}),
       },
     })
-
     const data = await res.json().catch(() => ({}))
     if (!res.ok) {
-      const message = data.message || 'Request failed'
-      if (res.status === 401) {
-        clearAuthSession(message)
-      }
-      throw new Error(message)
+      if (res.status === 401) clearAuthSession(data.message || 'Unauthorized')
+      throw new Error(data.message || 'Request failed')
     }
     return data
   }
@@ -114,364 +138,256 @@ function App() {
     return ''
   }
 
-  const pickUploadedUrl = (payload, context = {}) => {
-    const urlsFieldCandidates = []
-    if (typeof payload?.urls === 'string') {
-      urlsFieldCandidates.push(payload.urls)
-    } else if (Array.isArray(payload?.urls)) {
-      for (const item of payload.urls) {
-        if (typeof item === 'string') {
-          urlsFieldCandidates.push(item)
-        } else if (item && typeof item === 'object') {
-          urlsFieldCandidates.push(item.url, item.path, item.fileUrl, item.location)
-        }
-      }
-    } else if (payload?.urls && typeof payload.urls === 'object') {
-      for (const value of Object.values(payload.urls)) {
-        if (typeof value === 'string') {
-          urlsFieldCandidates.push(value)
-        } else if (value && typeof value === 'object') {
-          urlsFieldCandidates.push(value.url, value.path, value.fileUrl, value.location)
-        }
-      }
-    }
-
+  const pickUploadedUrl = (payload = {}) => {
     const candidates = [
       payload?.url,
       payload?.fileUrl,
-      payload?.secure_url,
       payload?.path,
-      payload?.filePath,
-      payload?.location,
+      payload?.urls?.[0],
+      payload?.urls?.[0]?.url,
+      payload?.urls?.[0]?.path,
       payload?.data?.url,
       payload?.data?.fileUrl,
       payload?.data?.path,
-      payload?.result?.url,
-      payload?.result?.path,
-      payload?.file?.url,
-      payload?.file?.path,
-      payload?.files?.[0]?.url,
-      payload?.files?.[0]?.path,
-      payload?.data?.files?.[0]?.url,
-      payload?.data?.files?.[0]?.path,
-      payload?.urls?.[0]?.url,
-      payload?.urls?.[0]?.path,
-      payload?.urls?.[0],
+      payload?.data?.urls?.[0],
       payload?.data?.urls?.[0]?.url,
       payload?.data?.urls?.[0]?.path,
-      payload?.data?.urls?.[0],
-      ...urlsFieldCandidates,
+      payload?.result?.url,
+      payload?.result?.path,
+      payload?.files?.[0]?.url,
+      payload?.files?.[0]?.path,
     ]
 
     for (const value of candidates) {
       const normalized = normalizeUploadUrl(value)
       if (normalized) return normalized
     }
-
-    const fileNameCandidates = [
-      payload?.filename,
-      payload?.fileName,
-      payload?.name,
-      payload?.savedName,
-      payload?.data?.filename,
-      payload?.data?.fileName,
-      payload?.file?.filename,
-      payload?.file?.name,
-      payload?.files?.[0]?.filename,
-      payload?.files?.[0]?.name,
-      payload?.data?.files?.[0]?.filename,
-      payload?.data?.files?.[0]?.name,
-    ]
-    const firstFileName = fileNameCandidates.find((v) => typeof v === 'string' && v.trim())
-    if (firstFileName && context.username && context.mediaType) {
-      return `${UPLOAD_SERVER_URL}/uploads/chat/${encodeURIComponent(context.username)}/${context.mediaType}/${encodeURIComponent(firstFileName.trim())}`
-    }
-
-    const keys = payload && typeof payload === 'object' ? Object.keys(payload).join(', ') : 'none'
-    throw new Error(`Upload server response did not include file URL (keys: ${keys || 'none'})`)
+    throw new Error('Upload server did not return URL')
   }
 
-  const uploadToExternalServer = async (file, mediaType) => {
-    if (!UPLOAD_SERVER_URL) {
-      throw new Error('Upload server URL is not configured')
-    }
-    if (!currentUser?.username) {
-      throw new Error('User not ready for upload')
-    }
-
-    // mediaType: 'images', 'videos', 'audios', 'files'
-    const endpoint = `${UPLOAD_SERVER_URL}/upload/chat/${encodeURIComponent(currentUser.username)}/${mediaType}`
-
-    const formData = new FormData()
-    formData.append(UPLOAD_FILE_FIELD, file)
-
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      body: formData,
-    })
-
-    const payload = await response.json().catch(() => ({}))
-    if (!response.ok) {
-      throw new Error(payload.error || payload.message || 'Upload failed')
-    }
-
-    return pickUploadedUrl(payload, { username: currentUser.username, mediaType })
-  }
-
-  const appendMessage = (otherUserId, message) => {
-    const key = String(otherUserId)
-    setMessagesByUser((prev) => {
-      const prevList = prev[key] || []
-      if (prevList.some((item) => item.id === message.id)) {
-        return prev
-      }
-      return {
-        ...prev,
-        [key]: [...prevList, message],
-      }
-    })
-  }
-
-  const removeMessageById = (messageId, otherUserId) => {
-    const key = String(otherUserId)
-    setMessagesByUser((prev) => {
-      const prevList = prev[key] || []
-      return {
-        ...prev,
-        [key]: prevList.filter((item) => item.id !== messageId),
-      }
-    })
-  }
-
-  const clearConversationLocal = (otherUserId) => {
-    const key = String(otherUserId)
-    setMessagesByUser((prev) => ({
-      ...prev,
-      [key]: [],
-    }))
+  const uploadToExternalServer = async (file, mediaType, targetUniqueUsername) => {
+    const uniqueUsername = targetUniqueUsername || currentUser?.uniqueUsername || currentUser?.username
+    if (!uniqueUsername) throw new Error('User not ready for upload')
+    const endpoint = `${UPLOAD_SERVER_URL}/upload/chat/${encodeURIComponent(uniqueUsername)}/${mediaType}`
+    const fd = new FormData()
+    fd.append(UPLOAD_FILE_FIELD, file)
+    const res = await fetch(endpoint, { method: 'POST', body: fd })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(data.message || 'Upload failed')
+    return pickUploadedUrl(data)
   }
 
   const fetchContacts = async (authToken = token) => {
-    const usersRes = await apiFetch('/api/users', {}, authToken)
-    const fetchedUsers = usersRes.users || []
-    setUsers(fetchedUsers)
-    return fetchedUsers
+    const data = await apiFetch('/api/users', {}, authToken)
+    setUsers(data.users || [])
+    return data.users || []
   }
 
-  const loadConversation = async (otherUserId, authToken = token) => {
-    if (!otherUserId) return
-    try {
-      const data = await apiFetch(`/api/messages/${otherUserId}`, {}, authToken)
-      setMessagesByUser((prev) => ({
-        ...prev,
-        [String(otherUserId)]: data.messages || [],
-      }))
-    } catch (err) {
-      setError(err.message)
-    }
+  const fetchGroups = async (authToken = token) => {
+    const data = await apiFetch('/api/groups', {}, authToken)
+    setGroups(data.groups || [])
+    return data.groups || []
   }
 
-  const bootstrap = async (authToken) => {
-    setLoadingApp(true)
-    setError('')
+  const loadDirectConversation = async (id, authToken = token) => {
+    const data = await apiFetch(`/api/messages/${id}`, {}, authToken)
+    setMessagesByUser((prev) => ({ ...prev, [String(id)]: data.messages || [] }))
+  }
+
+  const loadGroupConversation = async (id, authToken = token) => {
+    const data = await apiFetch(`/api/groups/${id}/messages`, {}, authToken)
+    setGroupMessagesById((prev) => ({ ...prev, [String(id)]: data.messages || [] }))
+    await markGroupSeen(id)
+  }
+
+  const markGroupSeen = async (groupId) => {
+    if (groupSeenRequestRef.current[groupId]) return
+    groupSeenRequestRef.current[groupId] = true
     try {
-      const meRes = await apiFetch('/api/auth/me', {}, authToken)
-      setCurrentUser(meRes.user)
-
-      const fetchedUsers = await fetchContacts(authToken)
-
-      if (fetchedUsers.length > 0) {
-        const firstUserId = fetchedUsers[0].id
-        setActiveChatId(firstUserId)
-        await loadConversation(firstUserId, authToken)
-      } else {
-        setActiveChatId(null)
-      }
-
-      const socket = io(SOCKET_URL, {
-        auth: { token: authToken },
-        transports: ['websocket'],
-      })
-
-      socket.on('chat:message', (message) => {
-        const isFromMe = message.senderId === meRes.user.id
-        const otherUserId = isFromMe ? message.receiverId : message.senderId
-        appendMessage(otherUserId, message)
-      })
-      socket.on('chat:message-deleted', (payload) => {
-        removeMessageById(payload.messageId, payload.withUserId)
-      })
-      socket.on('chat:conversation-cleared', (payload) => {
-        clearConversationLocal(payload.withUserId)
-      })
-      socket.on('connect_error', (socketError) => {
-        const msg = socketError?.message || ''
-        if (msg.toLowerCase().includes('unauthorized') || msg.toLowerCase().includes('invalid token')) {
-          clearAuthSession(msg)
-        }
-      })
-
-      socketRef.current = socket
-    } catch (err) {
-      setError(err.message)
-      localStorage.removeItem('chat_token')
-      setToken('')
-      setCurrentUser(null)
-      setUsers([])
-      setActiveChatId(null)
+      await apiFetch(`/api/groups/${groupId}/seen`, { method: 'POST' })
+      setGroups((prev) => prev.map((g) => (g.id === groupId ? { ...g, unreadCount: 0 } : g)))
     } finally {
-      setLoadingApp(false)
+      groupSeenRequestRef.current[groupId] = false
+    }
+  }
+
+  const openConversation = async (conversation) => {
+    setActiveConversation(conversation)
+    setIsMobileChatOpen(true)
+    setIsProfileOpen(false)
+    setProfileMenuOpen(false)
+    if (typeof window !== 'undefined' && window.matchMedia('(max-width: 767px)').matches) {
+      window.history.pushState({ mobileChatOpen: true, conversation }, '')
+    }
+    try {
+      if (conversation.type === 'group') await loadGroupConversation(conversation.id)
+      else await loadDirectConversation(conversation.id)
+    } catch (e) {
+      setError(e.message)
     }
   }
 
   useEffect(() => {
-    if (!token) return
-
-    bootstrap(token)
-
     return () => {
-      if (socketRef.current) {
-        socketRef.current.disconnect()
-        socketRef.current = null
-      }
+      clearPendingMedia()
     }
-  }, [token])
+  }, [])
 
   useEffect(() => {
-    window.history.replaceState({ mobileChatOpen: false }, '')
+    clearPendingMedia()
+  }, [activeConversation?.id, activeConversation?.type])
 
-    const handlePopState = (event) => {
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    window.history.replaceState({ mobileChatOpen: false }, '')
+    const onPopState = (event) => {
       const state = event.state
       if (state?.mobileChatOpen) {
-        if (state.chatId) setActiveChatId(state.chatId)
         setIsMobileChatOpen(true)
         return
       }
       setIsMobileChatOpen(false)
     }
-
-    window.addEventListener('popstate', handlePopState)
-    return () => window.removeEventListener('popstate', handlePopState)
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
   }, [])
 
-  const filteredUsers = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase()
-    if (!q) return users
-    return users.filter((user) => {
-      return (
-        user.username.toLowerCase().includes(q) ||
-        (user.email || '').toLowerCase().includes(q) ||
-        (user.mobileNumber || '').toLowerCase().includes(q)
-      )
-    })
-  }, [users, searchQuery])
-
-  const activeChat = useMemo(() => {
-    return users.find((u) => u.id === activeChatId) || null
-  }, [users, activeChatId])
-
-  const activeMessages = useMemo(() => {
-    if (!activeChatId) return []
-    return messagesByUser[String(activeChatId)] || []
-  }, [messagesByUser, activeChatId])
-
-  useEffect(() => {
-    const listEl = messageListRef.current
-    if (!listEl) return
-    requestAnimationFrame(() => {
-      listEl.scrollTo({
-        top: listEl.scrollHeight,
-        behavior: activeMessages.length <= 1 ? 'auto' : 'smooth',
-      })
-    })
-  }, [activeChatId, activeMessages.length])
-
-  const getInitials = (name = '') => {
-    return name
-      .split(' ')
-      .map((word) => word[0])
-      .join('')
-      .slice(0, 2)
-      .toUpperCase()
-  }
-
-  const formatTime = (dateValue) => {
-    if (!dateValue) return ''
-    return new Date(dateValue).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
-  }
-
-  const getLastMessageForUser = (userId) => {
-    const list = messagesByUser[String(userId)] || []
-    if (list.length === 0) return null
-    return list[list.length - 1]
-  }
-
-  const openChat = async (chatId) => {
-    setActiveChatId(chatId)
-    setIsMobileChatOpen(true)
-    setIsProfileOpen(false)
-    setProfileMenuOpen(false)
-    if (window.matchMedia('(max-width: 767px)').matches) {
-      window.history.pushState({ mobileChatOpen: true, chatId }, '')
-    }
-    await loadConversation(chatId)
-  }
-
   const backToList = () => {
-    if (window.matchMedia('(max-width: 767px)').matches && window.history.state?.mobileChatOpen) {
+    if (typeof window !== 'undefined' && window.matchMedia('(max-width: 767px)').matches && window.history.state?.mobileChatOpen) {
       window.history.back()
       return
     }
     setIsMobileChatOpen(false)
   }
 
-  const openProfile = () => {
-    if (!activeChat) return
-    setIsProfileOpen(true)
-  }
+  useEffect(() => {
+    if (!token) return
+    let mounted = true
+    ;(async () => {
+      setLoadingApp(true)
+      setError('')
+      try {
+        const me = await apiFetch('/api/auth/me', {}, token)
+        if (!mounted) return
+        setCurrentUser(me.user)
+        const [fetchedUsers, fetchedGroups] = await Promise.all([fetchContacts(token), fetchGroups(token)])
+        if (!mounted) return
+        if (fetchedUsers[0]) {
+          setActiveConversation({ type: 'direct', id: fetchedUsers[0].id })
+          await loadDirectConversation(fetchedUsers[0].id, token)
+        } else if (fetchedGroups[0]) {
+          setActiveConversation({ type: 'group', id: fetchedGroups[0].id })
+          await loadGroupConversation(fetchedGroups[0].id, token)
+        }
 
-  const closeProfile = () => {
-    setIsProfileOpen(false)
-    setProfileMenuOpen(false)
-  }
-
-  const onRegister = async (event) => {
-    event.preventDefault()
-    setSubmitting(true)
-    setError('')
-
-    try {
-      const payload = {
-        ...registerForm,
-        email: registerForm.email || undefined,
-        mobileNumber: registerForm.mobileNumber || undefined,
+        const socket = io(SOCKET_URL, { auth: { token }, transports: ['websocket'] })
+        socket.on('chat:message', (message) => {
+          const otherId = Number(message.senderId) === Number(me.user.id) ? message.receiverId : message.senderId
+          const isFromMe = Number(message.senderId) === Number(me.user.id)
+          setMessagesByUser((prev) => {
+            const key = String(otherId)
+            const list = prev[key] || []
+            if (list.some((m) => m.id === message.id)) return prev
+            return { ...prev, [key]: [...list, message] }
+          })
+          if (!isFromMe && !(activeConversation?.type === 'direct' && Number(activeConversation.id) === Number(otherId))) {
+            setUsers((prev) => prev.map((u) => (u.id === otherId ? { ...u, unreadCount: (Number(u.unreadCount) || 0) + 1 } : u)))
+          }
+        })
+        socket.on('chat:group-message', (message) => {
+          setGroupMessagesById((prev) => {
+            const key = String(message.groupId)
+            const list = prev[key] || []
+            if (list.some((m) => m.id === message.id)) return prev
+            return { ...prev, [key]: [...list, message] }
+          })
+          setGroups((prev) =>
+            prev.map((g) => {
+              if (g.id !== message.groupId) return g
+              const isOpen = activeConversation?.type === 'group' && Number(activeConversation.id) === Number(g.id)
+              const fromMe = Number(message.senderId) === Number(me.user.id)
+              return { ...g, lastMessage: message, unreadCount: !isOpen && !fromMe ? (Number(g.unreadCount) || 0) + 1 : g.unreadCount || 0 }
+            }),
+          )
+        })
+        socket.on('chat:group-created', (group) => {
+          setGroups((prev) => (prev.some((g) => g.id === group.id) ? prev : [group, ...prev]))
+        })
+        socket.on('chat:presence', (payload) => {
+          setUsers((prev) => prev.map((u) => (u.id === payload.userId ? { ...u, isOnline: payload.isOnline, lastSeen: payload.lastSeen } : u)))
+        })
+        socket.on('chat:messages-seen', (payload) => {
+          const withUserId = Number(payload?.withUserId)
+          if (!Number.isInteger(withUserId)) return
+          const seenSet = new Set((payload.messageIds || []).map((id) => Number(id)))
+          setMessagesByUser((prev) => {
+            const key = String(withUserId)
+            return {
+              ...prev,
+              [key]: (prev[key] || []).map((m) => (seenSet.has(Number(m.id)) ? { ...m, seen: true } : m)),
+            }
+          })
+          setUsers((prev) => prev.map((u) => (u.id === withUserId ? { ...u, unreadCount: 0 } : u)))
+        })
+        socketRef.current = socket
+      } catch (e) {
+        setError(e.message)
+        clearAuthSession('')
+      } finally {
+        if (mounted) setLoadingApp(false)
       }
-      const data = await apiFetch('/api/auth/register', {
-        method: 'POST',
-        body: JSON.stringify(payload),
-      }, '')
-
-      localStorage.setItem('chat_token', data.token)
-      setToken(data.token)
-      setRegisterForm({ username: '', email: '', mobileNumber: '', dateOfBirth: '', password: '' })
-    } catch (err) {
-      setError(err.message)
-    } finally {
-      setSubmitting(false)
+    })()
+    return () => {
+      mounted = false
+      socketRef.current?.disconnect()
+      socketRef.current = null
     }
+  }, [token])
+
+  useEffect(() => {
+    const list = messageListRef.current
+    if (!list) return
+    requestAnimationFrame(() => list.scrollTo({ top: list.scrollHeight, behavior: activeMessages.length <= 1 ? 'auto' : 'smooth' }))
+  }, [activeMessages.length, activeConversation?.id, activeConversationType])
+
+  const filteredUsers = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase()
+    if (!q) return users
+    return users.filter((u) => u.username.toLowerCase().includes(q) || (u.email || '').toLowerCase().includes(q) || (u.mobileNumber || '').toLowerCase().includes(q))
+  }, [users, searchQuery])
+
+  const filteredGroups = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase()
+    if (!q) return groups
+    return groups.filter((g) => g.name.toLowerCase().includes(q))
+  }, [groups, searchQuery])
+
+  const getInitials = (name = '') => name.split(' ').map((p) => p[0]).join('').slice(0, 2).toUpperCase()
+  const formatTime = (value) => (value ? new Date(value).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '')
+  const formatLastSeen = (value) => {
+    if (!value) return 'offline'
+    const diff = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1000))
+    if (diff < 60) return 'last active just now'
+    if (diff < 3600) return `last active ${Math.floor(diff / 60)}m ago`
+    if (diff < 86400) return `last active ${Math.floor(diff / 3600)}h ago`
+    return `last active ${Math.floor(diff / 86400)}d ago`
   }
 
-  const onLogin = async (event) => {
-    event.preventDefault()
+  const getLastMessageForUser = (id) => {
+    const list = messagesByUser[String(id)] || []
+    return list[list.length - 1] || null
+  }
+  const getLastMessageForGroup = (id) => {
+    const list = groupMessagesById[String(id)] || []
+    return list[list.length - 1] || groups.find((g) => g.id === id)?.lastMessage || null
+  }
+
+  const onLogin = async (e) => {
+    e.preventDefault()
     setSubmitting(true)
     setError('')
-
     try {
-      const data = await apiFetch('/api/auth/login', {
-        method: 'POST',
-        body: JSON.stringify(loginForm),
-      }, '')
-
+      const data = await apiFetch('/api/auth/login', { method: 'POST', body: JSON.stringify(loginForm) }, '')
       localStorage.setItem('chat_token', data.token)
       setToken(data.token)
       setLoginForm({ identifier: '', password: '' })
@@ -482,127 +398,220 @@ function App() {
     }
   }
 
-  const onAddContact = async (event) => {
-    event.preventDefault()
-    const identifier = contactIdentifier.trim()
-    if (!identifier) return
+  const onRegister = async (e) => {
+    e.preventDefault()
+    setSubmitting(true)
+    setError('')
+    try {
+      const payload = { ...registerForm, email: registerForm.email || undefined, mobileNumber: registerForm.mobileNumber || undefined }
+      const data = await apiFetch('/api/auth/register', { method: 'POST', body: JSON.stringify(payload) }, '')
+      if (registerProfileFile) {
+        const uniqueUsername = data?.user?.uniqueUsername || data?.user?.username
+        const profileMediaUrl = await uploadToExternalServer(registerProfileFile, 'profile', uniqueUsername)
+        await apiFetch('/api/users/profile-media', { method: 'POST', body: JSON.stringify({ profileMediaUrl }) }, data.token)
+      }
+      localStorage.setItem('chat_token', data.token)
+      setToken(data.token)
+      setRegisterForm({ username: '', email: '', mobileNumber: '', dateOfBirth: '', password: '' })
+      setRegisterProfileFile(null)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setSubmitting(false)
+    }
+  }
 
+  const onAddContact = async (event) => {
+    event?.preventDefault?.()
+    const identifier = contactIdentifier.trim()
+    if (!identifier) return { ok: false }
     setAddingContact(true)
     setError('')
     try {
-      const data = await apiFetch('/api/users/contacts', {
-        method: 'POST',
-        body: JSON.stringify({ identifier }),
-      })
+      const data = await apiFetch('/api/users/contacts', { method: 'POST', body: JSON.stringify({ identifier }) })
       const contacts = await fetchContacts()
-      const contactId = data.contact?.id
-      if (contactId && contacts.some((item) => item.id === contactId)) {
-        setActiveChatId(contactId)
-        await loadConversation(contactId)
+      if (data.contact?.id && contacts.some((c) => c.id === data.contact.id)) {
+        await openConversation({ type: 'direct', id: data.contact.id })
       }
       setContactIdentifier('')
+      return { ok: true }
     } catch (err) {
       setError(err.message)
+      return { ok: false }
     } finally {
       setAddingContact(false)
     }
   }
 
+  const lookupContact = async (identifier) => apiFetch(`/api/users/lookup?identifier=${encodeURIComponent(String(identifier || '').trim())}`)
+
   const sendMessage = async () => {
     const text = draftMessage.trim()
-    if (!text || !activeChatId || !currentUser) return
-
+    if (!text || !activeConversation || !currentUser) return
+    const tempId = `temp-${Date.now()}`
+    const temp = {
+      id: tempId,
+      senderId: currentUser.id,
+      receiverId: activeConversation.type === 'direct' ? activeConversation.id : null,
+      groupId: activeConversation.type === 'group' ? activeConversation.id : null,
+      text,
+      messageType: 'text',
+      createdAt: new Date().toISOString(),
+      clientStatus: 'sending',
+    }
+    const targetSetter = activeConversation.type === 'group' ? setGroupMessagesById : setMessagesByUser
+    targetSetter((prev) => {
+      const key = String(activeConversation.id)
+      return { ...prev, [key]: [...(prev[key] || []), temp] }
+    })
     setDraftMessage('')
 
     const socket = socketRef.current
-    if (socket && socket.connected) {
-      socket.emit('chat:send', { toUserId: activeChatId, text }, (ack) => {
-        if (!ack?.ok) {
-          setError(ack?.message || 'Message send failed')
-        }
+    if (socket?.connected && activeConversation.type === 'direct') {
+      socket.emit('chat:send', { toUserId: activeConversation.id, text }, (ack) => {
+        if (!ack?.ok) return setError(ack?.message || 'Message failed')
+        setMessagesByUser((prev) => {
+          const key = String(activeConversation.id)
+          const list = prev[key] || []
+          return { ...prev, [key]: replaceTempWithServerMessage(list, tempId, ack.message) }
+        })
+      })
+      return
+    }
+    if (socket?.connected && activeConversation.type === 'group') {
+      socket.emit('chat:group-send', { groupId: activeConversation.id, text }, (ack) => {
+        if (!ack?.ok) return setError(ack?.message || 'Group message failed')
+        setGroupMessagesById((prev) => {
+          const key = String(activeConversation.id)
+          const list = prev[key] || []
+          return { ...prev, [key]: replaceTempWithServerMessage(list, tempId, ack.message) }
+        })
       })
       return
     }
 
     try {
-      const data = await apiFetch(`/api/messages/${activeChatId}`, {
-        method: 'POST',
-        body: JSON.stringify({ text }),
+      const path = activeConversation.type === 'group' ? `/api/groups/${activeConversation.id}/messages` : `/api/messages/${activeConversation.id}`
+      const data = await apiFetch(path, { method: 'POST', body: JSON.stringify({ text }) })
+      targetSetter((prev) => {
+        const key = String(activeConversation.id)
+        const list = prev[key] || []
+        return { ...prev, [key]: replaceTempWithServerMessage(list, tempId, data.message) }
       })
-      appendMessage(activeChatId, data.message)
     } catch (err) {
       setError(err.message)
     }
   }
 
   const sendMedia = async (file, options = {}) => {
-    if (!file || !activeChatId || !currentUser) return
-
+    if (!file || !activeConversation) return
     const isImage = file.type.startsWith('image/')
     const isVideo = file.type.startsWith('video/')
     const isAudio = file.type.startsWith('audio/')
-    
-    let mediaFolder
-    let messageType
-    
-    if (isImage) {
-      mediaFolder = 'images'
-      messageType = 'image'
-    } else if (isVideo) {
-      mediaFolder = 'videos'
-      messageType = 'video'
-    } else if (isAudio) {
-      mediaFolder = 'audios'
-      messageType = 'audio'
-    } else {
-      mediaFolder = 'files'
-      messageType = 'file'
-    }
-
-    setUploadingMedia(true)
-    setError('')
+    const mediaFolder = isImage ? 'images' : isVideo ? 'videos' : isAudio ? 'audios' : 'files'
+    const messageType = isImage ? 'image' : isVideo ? 'video' : isAudio ? 'audio' : 'file'
+    if (!options.skipUploadingState) setUploadingMedia(true)
     try {
       const mediaUrl = await uploadToExternalServer(file, mediaFolder)
-      const durationFromOptions =
-        Number.isFinite(Number(options.mediaDurationSec)) && Number(options.mediaDurationSec) >= 0
-          ? Math.floor(Number(options.mediaDurationSec))
-          : null
-      const data = await apiFetch(`/api/messages/${activeChatId}`, {
+      const path = activeConversation.type === 'group' ? `/api/groups/${activeConversation.id}/messages` : `/api/messages/${activeConversation.id}`
+      const data = await apiFetch(path, {
         method: 'POST',
         body: JSON.stringify({
-          text: '',
           mediaUrl,
           messageType,
+          mediaGroupId: options.mediaGroupId || null,
           mediaMimeType: file.type || null,
           mediaOriginalName: file.name || null,
-          mediaDurationSec: messageType === 'audio' ? durationFromOptions : null,
+          mediaDurationSec: messageType === 'audio' ? Math.floor(Number(options.mediaDurationSec || 0)) : null,
+          text: '',
         }),
       })
-      appendMessage(activeChatId, data.message)
+      if (activeConversation.type === 'group') {
+        setGroupMessagesById((prev) => {
+          const key = String(activeConversation.id)
+          const list = prev[key] || []
+          if (list.some((m) => m.id === data.message?.id)) return prev
+          return { ...prev, [key]: [...list, data.message] }
+        })
+      } else {
+        setMessagesByUser((prev) => {
+          const key = String(activeConversation.id)
+          const list = prev[key] || []
+          if (list.some((m) => m.id === data.message?.id)) return prev
+          return { ...prev, [key]: [...list, data.message] }
+        })
+      }
     } catch (err) {
       setError(err.message)
+    } finally {
+      if (!options.skipUploadingState) setUploadingMedia(false)
+    }
+  }
+
+  const createMediaGroupId = () => `mg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+
+  const sendMediaBatch = async (files) => {
+    if (!Array.isArray(files) || files.length === 0) return
+    const picked = files.slice(0, 10)
+    const canGroup = picked.every((file) => file?.type?.startsWith('image/') || file?.type?.startsWith('video/'))
+    const mediaGroupId = canGroup && picked.length > 1 ? createMediaGroupId() : null
+
+    setUploadingMedia(true)
+    try {
+      for (const file of picked) {
+        // Keep sequential uploads so conversation order remains stable.
+        await sendMedia(file, { mediaGroupId, skipUploadingState: true })
+      }
     } finally {
       setUploadingMedia(false)
     }
   }
 
-  const uploadProfileMedia = async (file) => {
-    if (!file || !currentUser) return
-    if (!file.type.startsWith('image/')) {
-      setError('Profile must be an image file')
+  const pickMediaFiles = async (files) => {
+    if (!Array.isArray(files) || files.length === 0 || !activeConversation) return
+    const picked = files.slice(0, 10)
+    const allVisual = picked.every((file) => file?.type?.startsWith('image/') || file?.type?.startsWith('video/'))
+
+    if (!allVisual) {
+      await sendMediaBatch(picked)
       return
     }
 
+    setPendingMedia((prev) => {
+      const remain = Math.max(0, 10 - prev.length)
+      const nextFiles = picked.slice(0, remain)
+      const nextItems = nextFiles.map((file) => ({
+        id: `pm-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        file,
+        previewUrl: URL.createObjectURL(file),
+        kind: file.type.startsWith('video/') ? 'video' : 'image',
+      }))
+      return [...prev, ...nextItems]
+    })
+  }
+
+  const removePendingMedia = (pendingId) => {
+    setPendingMedia((prev) => {
+      const target = prev.find((item) => item.id === pendingId)
+      if (target?.previewUrl) URL.revokeObjectURL(target.previewUrl)
+      return prev.filter((item) => item.id !== pendingId)
+    })
+  }
+
+  const sendPendingMedia = async () => {
+    if (pendingMedia.length === 0) return
+    const files = pendingMedia.map((item) => item.file)
+    await sendMediaBatch(files)
+    clearPendingMedia()
+  }
+
+  const uploadProfileMedia = async (file) => {
+    if (!file) return
     setUploadingProfile(true)
-    setError('')
     try {
-      const profileMediaUrl = await uploadToExternalServer(file, 'images')
-      const data = await apiFetch('/api/users/profile-media', {
-        method: 'POST',
-        body: JSON.stringify({ profileMediaUrl }),
-      })
-      setCurrentUser((prev) => ({ ...prev, profileMediaUrl }))
-      setUsers((prev) => prev.map((item) => (item.id === data.user.id ? { ...item, profileMediaUrl } : item)))
+      const profileMediaUrl = await uploadToExternalServer(file, 'profile')
+      const data = await apiFetch('/api/users/profile-media', { method: 'POST', body: JSON.stringify({ profileMediaUrl }) })
+      setCurrentUser((prev) => ({ ...prev, ...(data.user || {}), profileMediaUrl }))
     } catch (err) {
       setError(err.message)
     } finally {
@@ -610,97 +619,62 @@ function App() {
     }
   }
 
-  const deleteMessage = async (messageId) => {
-    if (!activeChatId) return
+  const createGroup = async () => {
+    if (!groupNameInput.trim() || groupMemberIds.length === 0) return
+    setCreatingGroup(true)
     try {
-      // Find the message to delete its media from upload server
-      const messages = messagesByUser[String(activeChatId)] || []
-      const msg = messages.find((m) => m.id === messageId)
-      if (msg?.mediaUrl) {
-        await deleteMediaFromUploadServer(msg.mediaUrl)
-      }
-      await apiFetch(`/api/messages/${messageId}`, {
-        method: 'DELETE',
-      })
-      removeMessageById(messageId, activeChatId)
+      const data = await apiFetch('/api/groups', { method: 'POST', body: JSON.stringify({ name: groupNameInput.trim(), memberIds: groupMemberIds }) })
+      setGroups((prev) => (prev.some((g) => g.id === data.group.id) ? prev : [data.group, ...prev]))
+      setIsCreateGroupOpen(false)
+      setGroupNameInput('')
+      setGroupMemberIds([])
+      await openConversation({ type: 'group', id: data.group.id })
     } catch (err) {
       setError(err.message)
+    } finally {
+      setCreatingGroup(false)
     }
+  }
+
+  const deleteMessage = async (messageId) => {
+    if (!activeConversation || activeConversation.type !== 'direct') return
+    await apiFetch(`/api/messages/${messageId}`, { method: 'DELETE' })
+    setMessagesByUser((prev) => {
+      const key = String(activeConversation.id)
+      return { ...prev, [key]: (prev[key] || []).filter((m) => m.id !== messageId) }
+    })
   }
 
   const clearChat = async () => {
-    if (!activeChatId) return
-    try {
-      // Delete all media files from upload server
-      const messages = messagesByUser[String(activeChatId)] || []
-      await Promise.all(
-        messages.filter((m) => m.mediaUrl).map((m) => deleteMediaFromUploadServer(m.mediaUrl))
-      )
-      await apiFetch(`/api/messages/chat/${activeChatId}`, {
-        method: 'DELETE',
-      })
-      clearConversationLocal(activeChatId)
-      setIsProfileOpen(false)
-      setProfileMenuOpen(false)
-    } catch (err) {
-      setError(err.message)
-    }
+    if (!activeConversation || activeConversation.type !== 'direct') return
+    await apiFetch(`/api/messages/chat/${activeConversation.id}`, { method: 'DELETE' })
+    setMessagesByUser((prev) => ({ ...prev, [String(activeConversation.id)]: [] }))
   }
 
   const deleteChat = async () => {
-    if (!activeChatId) return
-    try {
-      // Delete all media files from upload server
-      const messages = messagesByUser[String(activeChatId)] || []
-      await Promise.all(
-        messages.filter((m) => m.mediaUrl).map((m) => deleteMediaFromUploadServer(m.mediaUrl))
-      )
-      await apiFetch(`/api/messages/chat/${activeChatId}`, { method: 'DELETE' })
-      await apiFetch(`/api/users/contacts/${activeChatId}`, { method: 'DELETE' })
-
-      setUsers((prev) => prev.filter((item) => item.id !== activeChatId))
-      setMessagesByUser((prev) => {
-        const next = { ...prev }
-        delete next[String(activeChatId)]
-        return next
-      })
-      setActiveChatId(null)
-      setIsProfileOpen(false)
-      setIsMobileChatOpen(false)
-      setProfileMenuOpen(false)
-    } catch (err) {
-      setError(err.message)
-    }
+    if (!activeConversation || activeConversation.type !== 'direct') return
+    await apiFetch(`/api/messages/chat/${activeConversation.id}`, { method: 'DELETE' })
+    await apiFetch(`/api/users/contacts/${activeConversation.id}`, { method: 'DELETE' })
+    setUsers((prev) => prev.filter((u) => u.id !== activeConversation.id))
+    setMessagesByUser((prev) => {
+      const next = { ...prev }
+      delete next[String(activeConversation.id)]
+      return next
+    })
+    setActiveConversation(null)
   }
 
-  const logout = () => {
-    clearAuthSession('')
-  }
-
-  const requestDeleteMessage = (messageId) => {
-    setConfirmAction({ type: 'delete_message', messageId })
-  }
-
-  const requestClearChat = () => {
-    setProfileMenuOpen(false)
-    setConfirmAction({ type: 'clear_chat' })
-  }
-
-  const requestDeleteChat = () => {
-    setProfileMenuOpen(false)
-    setConfirmAction({ type: 'delete_chat' })
-  }
+  const requestLogout = () => setConfirmAction({ type: 'logout' })
+  const requestDeleteMessage = (messageId) => setConfirmAction({ type: 'delete_message', messageId })
+  const requestClearChat = () => setConfirmAction({ type: 'clear_chat' })
+  const requestDeleteChat = () => setConfirmAction({ type: 'delete_chat' })
 
   const runConfirmAction = async () => {
     if (!confirmAction) return
-
-    if (confirmAction.type === 'delete_message') {
-      await deleteMessage(confirmAction.messageId)
-    } else if (confirmAction.type === 'clear_chat') {
-      await clearChat()
-    } else if (confirmAction.type === 'delete_chat') {
-      await deleteChat()
-    }
+    if (confirmAction.type === 'delete_message') await deleteMessage(confirmAction.messageId)
+    else if (confirmAction.type === 'clear_chat') await clearChat()
+    else if (confirmAction.type === 'delete_chat') await deleteChat()
+    else if (confirmAction.type === 'logout') clearAuthSession('')
     setConfirmAction(null)
   }
 
@@ -715,6 +689,8 @@ function App() {
         setLoginForm={setLoginForm}
         registerForm={registerForm}
         setRegisterForm={setRegisterForm}
+        registerProfileFile={registerProfileFile}
+        setRegisterProfileFile={setRegisterProfileFile}
         onLogin={onLogin}
         onRegister={onRegister}
       />
@@ -734,29 +710,39 @@ function App() {
       <section className="relative flex h-screen w-full overflow-hidden bg-white">
         <ChatSidebar
           isMobileChatOpen={isMobileChatOpen}
-          logout={logout}
+          currentUser={currentUser}
+          logout={requestLogout}
           searchQuery={searchQuery}
           setSearchQuery={setSearchQuery}
           onAddContact={onAddContact}
+          lookupContact={lookupContact}
           contactIdentifier={contactIdentifier}
           setContactIdentifier={setContactIdentifier}
           addingContact={addingContact}
-          error={error}
-          filteredUsers={filteredUsers}
-          activeChatId={activeChatId}
-          openChat={openChat}
-          getInitials={getInitials}
-          getLastMessageForUser={getLastMessageForUser}
-          formatTime={formatTime}
           uploadingProfile={uploadingProfile}
           onUploadProfile={uploadProfileMedia}
+          error={error}
+          filteredUsers={filteredUsers}
+          filteredGroups={filteredGroups}
+          activeConversation={activeConversation}
+          openConversation={openConversation}
+          openCreateGroup={() => setIsCreateGroupOpen(true)}
+          getInitials={getInitials}
+          getLastMessageForUser={getLastMessageForUser}
+          getLastMessageForGroup={getLastMessageForGroup}
+          formatTime={formatTime}
+          formatLastSeen={formatLastSeen}
         />
 
         <ChatPanel
           isMobileChatOpen={isMobileChatOpen}
           backToList={backToList}
           activeChat={activeChat}
-          openProfile={openProfile}
+          activeConversationType={activeConversationType}
+          groupMemberNames={groupMemberNames}
+          openProfile={() => {
+            if (activeConversationType !== 'group') setIsProfileOpen(true)
+          }}
           getInitials={getInitials}
           profileMenuOpen={profileMenuOpen}
           setProfileMenuOpen={setProfileMenuOpen}
@@ -766,26 +752,81 @@ function App() {
           activeMessages={activeMessages}
           currentUser={currentUser}
           formatTime={formatTime}
+          formatLastSeen={formatLastSeen}
           requestDeleteMessage={requestDeleteMessage}
           draftMessage={draftMessage}
           setDraftMessage={setDraftMessage}
           sendMessage={sendMessage}
           sendMedia={sendMedia}
+          onPickMediaFiles={pickMediaFiles}
+          pendingMedia={pendingMedia}
+          removePendingMedia={removePendingMedia}
+          clearPendingMedia={clearPendingMedia}
+          sendPendingMedia={sendPendingMedia}
           uploadingMedia={uploadingMedia}
+          markConversationSeen={async (otherUserId) => {
+            if (!otherUserId || seenRequestRef.current[otherUserId]) return
+            seenRequestRef.current[otherUserId] = true
+            try {
+              const data = await apiFetch(`/api/messages/${otherUserId}/seen`, { method: 'POST' })
+              const idSet = new Set((data.messageIds || []).map((id) => Number(id)))
+              setMessagesByUser((prev) => {
+                const key = String(otherUserId)
+                return {
+                  ...prev,
+                  [key]: (prev[key] || []).map((m) => (idSet.has(Number(m.id)) ? { ...m, seen: true } : m)),
+                }
+              })
+            } finally {
+              seenRequestRef.current[otherUserId] = false
+            }
+          }}
         />
 
         <ProfileDrawer
-          activeChat={activeChat}
+          activeChat={activeConversationType === 'direct' ? activeChat : null}
           isProfileOpen={isProfileOpen}
-          closeProfile={closeProfile}
+          closeProfile={() => setIsProfileOpen(false)}
           getInitials={getInitials}
         />
 
-        <ConfirmDialog
-          confirmAction={confirmAction}
-          setConfirmAction={setConfirmAction}
-          runConfirmAction={runConfirmAction}
-        />
+        <ConfirmDialog confirmAction={confirmAction} setConfirmAction={setConfirmAction} runConfirmAction={runConfirmAction} />
+
+        {isCreateGroupOpen ? (
+          <div className="absolute inset-0 z-40 grid place-items-center bg-black/35 p-4">
+            <div className="w-full max-w-lg rounded-xl bg-white p-4 shadow-xl">
+              <p className="text-lg font-semibold text-[#1f2c34]">Create group</p>
+              <input
+                type="text"
+                value={groupNameInput}
+                onChange={(e) => setGroupNameInput(e.target.value)}
+                placeholder="Group name"
+                className="mt-3 w-full rounded-lg border border-[#d8dde1] px-3 py-2 text-sm outline-none focus:border-[#25d366]"
+              />
+              <div className="mt-3 max-h-64 space-y-2 overflow-y-auto rounded-lg border border-[#ecf0f2] p-2">
+                {users.map((user) => (
+                  <label key={user.id} className="flex cursor-pointer items-center gap-3 rounded-md px-2 py-2 hover:bg-[#f6f8f9]">
+                    <input
+                      type="checkbox"
+                      checked={groupMemberIds.includes(user.id)}
+                      onChange={(e) => {
+                        if (e.target.checked) setGroupMemberIds((prev) => [...prev, user.id])
+                        else setGroupMemberIds((prev) => prev.filter((id) => id !== user.id))
+                      }}
+                    />
+                    <span className="text-sm text-[#1f2c34]">{user.username}</span>
+                  </label>
+                ))}
+              </div>
+              <div className="mt-4 flex justify-end gap-2">
+                <button type="button" onClick={() => setIsCreateGroupOpen(false)} className="rounded-md border border-[#d7dce0] px-3 py-1.5 text-sm text-[#1f2c34]">Cancel</button>
+                <button type="button" disabled={creatingGroup} onClick={createGroup} className="rounded-md bg-[#25d366] px-3 py-1.5 text-sm font-semibold text-white disabled:opacity-60">
+                  {creatingGroup ? 'Creating...' : 'Create group'}
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
       </section>
     </main>
   )

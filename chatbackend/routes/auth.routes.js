@@ -4,6 +4,7 @@ const authMiddleware = require('../middleware/auth')
 const { User } = require('../models')
 const { signToken } = require('../utils/token')
 const { ensureUserFolder } = require('../utils/upload-server')
+const { buildUnusedUniqueUsername, ensureUserUniqueUsername } = require('../utils/user-identity')
 
 const router = express.Router()
 
@@ -11,6 +12,7 @@ function serializeUser(user) {
   return {
     id: user.id,
     username: user.username,
+    uniqueUsername: user.uniqueUsername,
     email: user.email,
     mobileNumber: user.mobileNumber,
     dateOfBirth: user.dateOfBirth,
@@ -31,35 +33,40 @@ router.post('/register', async (req, res) => {
       return res.status(400).json({ message: 'email or mobileNumber is required' })
     }
 
-    const whereOr = [{ username }]
+    const whereOr = []
     if (email) whereOr.push({ email })
     if (mobileNumber) whereOr.push({ mobileNumber })
 
-    const existing = await User.scope('withPassword').findOne({
-      where: { [Op.or]: whereOr },
-    })
+    const existing =
+      whereOr.length > 0
+        ? await User.scope('withPassword').findOne({
+            where: { [Op.or]: whereOr },
+          })
+        : null
     if (existing) {
-      return res.status(409).json({ message: 'username/email/mobile already in use' })
+      return res.status(409).json({ message: 'email/mobile already in use' })
+    }
+
+    const uniqueUsername = await buildUnusedUniqueUsername(User, username)
+
+    try {
+      await ensureUserFolder(uniqueUsername)
+    } catch (folderError) {
+      return res.status(502).json({
+        message: 'Registration failed because upload folder creation failed',
+        error: folderError.message,
+      })
     }
 
     const user = await User.create({
       username,
+      uniqueUsername,
       email: email || null,
       mobileNumber: mobileNumber || null,
       dateOfBirth,
       passwordHash: password,
       lastSeen: new Date(),
     })
-
-    try {
-      await ensureUserFolder(user.username)
-    } catch (folderError) {
-      await user.destroy()
-      return res.status(502).json({
-        message: 'Registration failed because upload folder creation failed',
-        error: folderError.message,
-      })
-    }
 
     const token = signToken(user.id)
     return res.status(201).json({
@@ -81,11 +88,23 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ message: 'identifier (or username) and password are required' })
     }
 
-    const user = await User.scope('withPassword').findOne({
+    let user = await User.scope('withPassword').findOne({
       where: {
-        [Op.or]: [{ username: identifier }, { email: identifier }, { mobileNumber: identifier }],
+        [Op.or]: [{ uniqueUsername: identifier }, { email: identifier }, { mobileNumber: identifier }],
       },
     })
+
+    if (!user) {
+      const sameName = await User.scope('withPassword').findAll({
+        where: { username: identifier },
+        limit: 2,
+      })
+      if (sameName.length === 1) {
+        user = sameName[0]
+      } else if (sameName.length > 1) {
+        return res.status(409).json({ message: 'Multiple users found with this name. Please login using unique username/email/mobile' })
+      }
+    }
 
     if (!user) {
       return res.status(401).json({ message: 'Invalid credentials' })
@@ -96,6 +115,7 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ message: 'Invalid credentials' })
     }
 
+    await ensureUserUniqueUsername(user, User)
     user.lastSeen = new Date()
     await user.save()
 
