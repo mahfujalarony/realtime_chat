@@ -1,4 +1,4 @@
-import { ArrowLeft, Download, FileText, Loader2, Mic, Paperclip, Pause, Play, Square, Trash2, UsersRound, X } from 'lucide-react'
+import { ArrowLeft, Download, FileText, Loader2, Maximize2, Mic, Paperclip, Pause, Play, Square, Trash2, UsersRound, X } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 
 const AUDIO_MIME_CANDIDATES = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus']
@@ -14,6 +14,41 @@ function formatDuration(totalSeconds) {
 function pickSupportedAudioMimeType() {
   if (typeof MediaRecorder === 'undefined' || typeof MediaRecorder.isTypeSupported !== 'function') return ''
   return AUDIO_MIME_CANDIDATES.find((type) => MediaRecorder.isTypeSupported(type)) || ''
+}
+
+function ViewportMedia({ className = '', placeholderClassName = '', rootMargin = '220px', children }) {
+  const hostRef = useRef(null)
+  const [isVisible, setIsVisible] = useState(false)
+
+  useEffect(() => {
+    if (isVisible) return
+    const node = hostRef.current
+    if (!node) return
+
+    if (typeof IntersectionObserver === 'undefined') {
+      setIsVisible(true)
+      return
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const entry = entries[0]
+        if (entry?.isIntersecting) {
+          setIsVisible(true)
+          observer.disconnect()
+        }
+      },
+      { root: null, rootMargin, threshold: 0.01 },
+    )
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [isVisible, rootMargin])
+
+  return (
+    <div ref={hostRef} className={className}>
+      {isVisible ? children(true) : <div className={placeholderClassName} />}
+    </div>
+  )
 }
 
 function AudioMessageBubble({ url, fallbackDurationSec }) {
@@ -147,6 +182,9 @@ function ChatPanel({
   clearPendingMedia,
   sendPendingMedia,
   uploadingMedia,
+  hasOlderMessages,
+  loadingOlderMessages,
+  loadOlderMessages,
   markConversationSeen,
 }) {
   const mediaInputRef = useRef(null)
@@ -160,6 +198,8 @@ function ChatPanel({
   const [recordingError, setRecordingError] = useState('')
   const [previewMedia, setPreviewMedia] = useState(null)
   const seenCheckRafRef = useRef(null)
+  const lastScrollTopRef = useRef(0)
+  const ignoreOlderLoadUntilRef = useRef(0)
 
   const cleanupStream = () => {
     if (recordingTimerRef.current) {
@@ -232,13 +272,35 @@ function ChatPanel({
   }, [activeChat?.id, activeMessages, activeConversationType])
 
   useEffect(() => {
-    if (activeConversationType !== 'direct') return
+    // After switching chats, give UI time to auto-scroll to bottom before enabling top-load.
+    lastScrollTopRef.current = 0
+    ignoreOlderLoadUntilRef.current = Date.now() + 900
+  }, [activeChat?.id, activeConversationType])
+
+  useEffect(() => {
     const listEl = messageListRef?.current
     if (!listEl) return
-    const onScroll = () => maybeMarkSeenWhenLastVisible()
+    const onScroll = () => {
+      const currentTop = listEl.scrollTop
+      const isGoingUp = currentTop < lastScrollTopRef.current
+      lastScrollTopRef.current = currentTop
+
+      if (activeConversationType === 'direct') {
+        maybeMarkSeenWhenLastVisible()
+      }
+      if (
+        isGoingUp &&
+        currentTop <= 80 &&
+        hasOlderMessages &&
+        !loadingOlderMessages &&
+        Date.now() > ignoreOlderLoadUntilRef.current
+      ) {
+        loadOlderMessages?.()
+      }
+    }
     listEl.addEventListener('scroll', onScroll, { passive: true })
     return () => listEl.removeEventListener('scroll', onScroll)
-  }, [activeChat?.id, activeMessages, messageListRef, activeConversationType])
+  }, [activeChat?.id, activeMessages, messageListRef, activeConversationType, hasOlderMessages, loadingOlderMessages, loadOlderMessages])
 
   const startRecording = async () => {
     if (isRecording || uploadingMedia) return
@@ -419,6 +481,11 @@ function ChatPanel({
 
       <div ref={messageListRef} className="chat-wallpaper chat-scrollbar flex-1 overflow-y-auto px-4 py-2 md:px-12">
         <div className="messages-container mx-auto max-w-3xl">
+          {loadingOlderMessages ? (
+            <div className="mx-auto my-2 w-fit rounded-full bg-white/90 px-3 py-1 text-[11px] text-[#667781] shadow">
+              Loading older messages...
+            </div>
+          ) : null}
           {activeMessages.length === 0 ? (
             <div className="mx-auto my-4 rounded-lg bg-white/90 px-4 py-2 text-center text-xs text-[#54656f] shadow-sm">
               No messages yet. Start the conversation!
@@ -470,7 +537,7 @@ function ChatPanel({
                     ) : null}
 
                     {showAsAlbum ? (
-                      <div className="mb-1 grid max-w-[320px] grid-cols-3 gap-1 rounded-md">
+                      <div className="mb-1 grid max-w-[360px] grid-cols-3 gap-1 rounded-md">
                         {albumItems.map((item) =>
                           item.messageType === 'image' ? (
                             <div key={item.id} className="group/album relative h-24 w-full overflow-hidden rounded">
@@ -480,11 +547,16 @@ function ChatPanel({
                                 className="h-full w-full"
                                 title="Preview image"
                               >
-                                <img
-                                  src={item.mediaUrl}
-                                  alt={item.mediaOriginalName || 'Image'}
-                                  className="h-24 w-full object-cover"
-                                />
+                                <ViewportMedia className="h-24 w-full" placeholderClassName="h-24 w-full animate-pulse bg-[#dfe7eb]">
+                                  {(shouldLoad) => (
+                                    <img
+                                      src={shouldLoad ? item.mediaUrl : undefined}
+                                      alt={item.mediaOriginalName || 'Image'}
+                                      loading="lazy"
+                                      className="h-24 w-full object-cover"
+                                    />
+                                  )}
+                                </ViewportMedia>
                               </button>
                               <a
                                 href={`${item.mediaUrl}${item.mediaUrl.includes('?') ? '&' : '?'}download=1`}
@@ -496,14 +568,24 @@ function ChatPanel({
                               </a>
                             </div>
                           ) : (
-                            <div key={item.id} className="group/album relative h-24 w-full overflow-hidden rounded">
+                            <div key={item.id} className="group/album relative col-span-2 h-28 w-full overflow-hidden rounded">
+                              <ViewportMedia className="h-28 w-full" placeholderClassName="h-28 w-full animate-pulse bg-[#dfe7eb]">
+                                {(shouldLoad) => (
+                                  <video
+                                    src={shouldLoad ? item.mediaUrl : undefined}
+                                    controls
+                                    preload="none"
+                                    className="h-28 w-full object-cover"
+                                  />
+                                )}
+                              </ViewportMedia>
                               <button
                                 type="button"
                                 onClick={() => openMediaPreview(item)}
-                                className="h-full w-full"
-                                title="Preview video"
+                                className="absolute left-1 top-1 rounded-full bg-black/55 p-1 text-white opacity-0 transition group-hover/album:opacity-100"
+                                title="Open large preview"
                               >
-                                <video src={item.mediaUrl} muted className="h-24 w-full object-cover" />
+                                <Maximize2 size={12} />
                               </button>
                               <a
                                 href={`${item.mediaUrl}${item.mediaUrl.includes('?') ? '&' : '?'}download=1`}
@@ -522,11 +604,19 @@ function ChatPanel({
                     {!showAsAlbum && message.mediaUrl && message.messageType === 'image' ? (
                       <div className="group/single relative mb-1">
                         <button type="button" onClick={() => openMediaPreview(message)} title="Preview image">
-                          <img
-                            src={message.mediaUrl}
-                            alt={message.mediaOriginalName || 'Image'}
-                            className="max-h-64 w-auto rounded-md object-cover"
-                          />
+                          <ViewportMedia
+                            className="max-h-64 w-auto rounded-md"
+                            placeholderClassName="h-52 w-64 max-w-full animate-pulse rounded-md bg-[#dfe7eb]"
+                          >
+                            {(shouldLoad) => (
+                              <img
+                                src={shouldLoad ? message.mediaUrl : undefined}
+                                alt={message.mediaOriginalName || 'Image'}
+                                loading="lazy"
+                                className="max-h-64 w-auto rounded-md object-cover"
+                              />
+                            )}
+                          </ViewportMedia>
                         </button>
                         <a
                           href={`${message.mediaUrl}${message.mediaUrl.includes('?') ? '&' : '?'}download=1`}
@@ -541,8 +631,26 @@ function ChatPanel({
 
                     {!showAsAlbum && message.mediaUrl && message.messageType === 'video' ? (
                       <div className="group/single relative mb-1">
-                        <button type="button" onClick={() => openMediaPreview(message)} title="Preview video">
-                          <video src={message.mediaUrl} muted className="max-h-72 w-full rounded-md" />
+                        <ViewportMedia
+                          className="max-h-72 w-full rounded-md"
+                          placeholderClassName="h-56 w-full animate-pulse rounded-md bg-[#dfe7eb]"
+                        >
+                          {(shouldLoad) => (
+                            <video
+                              src={shouldLoad ? message.mediaUrl : undefined}
+                              controls
+                              preload="none"
+                              className="max-h-72 w-full rounded-md"
+                            />
+                          )}
+                        </ViewportMedia>
+                        <button
+                          type="button"
+                          onClick={() => openMediaPreview(message)}
+                          className="absolute left-2 top-2 rounded-full bg-black/55 p-1.5 text-white opacity-0 transition group-hover/single:opacity-100"
+                          title="Open large preview"
+                        >
+                          <Maximize2 size={14} />
                         </button>
                         <a
                           href={`${message.mediaUrl}${message.mediaUrl.includes('?') ? '&' : '?'}download=1`}

@@ -56,6 +56,10 @@ async function ensureContact(currentUserId, otherUserId) {
 router.get('/:userId', authMiddleware, async (req, res) => {
   try {
     const otherUserId = Number(req.params.userId)
+    const requestedLimit = Number(req.query.limit)
+    const limit = Number.isInteger(requestedLimit) ? Math.max(10, Math.min(100, requestedLimit)) : 40
+    const beforeIdRaw = Number(req.query.beforeId)
+    const beforeId = Number.isInteger(beforeIdRaw) ? beforeIdRaw : null
 
     if (!Number.isInteger(otherUserId)) {
       return res.status(400).json({ message: 'Invalid userId' })
@@ -70,17 +74,39 @@ router.get('/:userId', authMiddleware, async (req, res) => {
       return res.status(403).json({ message: 'Add this user to contacts first' })
     }
 
-    const messages = await Message.findAll({
-      where: {
-        [Op.or]: [
-          { senderId: req.user.id, receiverId: otherUserId },
-          { senderId: otherUserId, receiverId: req.user.id },
-        ],
-      },
-      order: [['createdAt', 'ASC']],
-    })
+    const conversationWhere = {
+      [Op.or]: [
+        { senderId: req.user.id, receiverId: otherUserId },
+        { senderId: otherUserId, receiverId: req.user.id },
+      ],
+    }
+    if (beforeId) {
+      conversationWhere.id = { [Op.lt]: beforeId }
+    }
 
-    return res.json({ messages: messages.map(formatMessage) })
+    const messagesDesc = await Message.findAll({
+      where: conversationWhere,
+      order: [['id', 'DESC']],
+      limit,
+    })
+    const messages = [...messagesDesc].reverse()
+
+    const oldestLoadedId = messages[0]?.id || null
+    const hasMore = Boolean(
+      oldestLoadedId &&
+        (await Message.findOne({
+          where: {
+            [Op.or]: [
+              { senderId: req.user.id, receiverId: otherUserId },
+              { senderId: otherUserId, receiverId: req.user.id },
+            ],
+            id: { [Op.lt]: oldestLoadedId },
+          },
+          attributes: ['id'],
+        })),
+    )
+
+    return res.json({ messages: messages.map(formatMessage), hasMore, nextBeforeId: oldestLoadedId })
   } catch (error) {
     return res.status(500).json({ message: 'Failed to fetch messages', error: error.message })
   }

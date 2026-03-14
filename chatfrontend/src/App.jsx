@@ -11,14 +11,23 @@ const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000'
 const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || API_URL
 const UPLOAD_SERVER_URL = import.meta.env.VITE_UPLOAD_SERVER_URL || 'http://localhost:5001'
 const UPLOAD_FILE_FIELD = import.meta.env.VITE_UPLOAD_FILE_FIELD || 'file'
+const CHAT_LIST_PAGE_SIZE = 30
+const MESSAGE_PAGE_SIZE = 40
 
 function App() {
   const [token, setToken] = useState(localStorage.getItem('chat_token') || '')
   const [currentUser, setCurrentUser] = useState(null)
   const [users, setUsers] = useState([])
   const [groups, setGroups] = useState([])
+  const [usersPage, setUsersPage] = useState(1)
+  const [groupsPage, setGroupsPage] = useState(1)
+  const [usersHasMore, setUsersHasMore] = useState(true)
+  const [groupsHasMore, setGroupsHasMore] = useState(true)
+  const [loadingMoreSidebar, setLoadingMoreSidebar] = useState(false)
   const [messagesByUser, setMessagesByUser] = useState({})
   const [groupMessagesById, setGroupMessagesById] = useState({})
+  const [directPaginationById, setDirectPaginationById] = useState({})
+  const [groupPaginationById, setGroupPaginationById] = useState({})
   const [activeConversation, setActiveConversation] = useState(null)
   const [searchQuery, setSearchQuery] = useState('')
   const [draftMessage, setDraftMessage] = useState('')
@@ -52,6 +61,7 @@ function App() {
 
   const socketRef = useRef(null)
   const messageListRef = useRef(null)
+  const suppressAutoScrollRef = useRef(false)
   const seenRequestRef = useRef({})
   const groupSeenRequestRef = useRef({})
 
@@ -68,6 +78,14 @@ function App() {
       ? groupMessagesById[String(activeConversation.id)] || []
       : messagesByUser[String(activeConversation.id)] || []
   }, [activeConversation, groupMessagesById, messagesByUser])
+
+  const activePaginationMeta = useMemo(() => {
+    if (!activeConversation) return { hasMore: false, loadingOlder: false }
+    if (activeConversation.type === 'group') {
+      return groupPaginationById[String(activeConversation.id)] || { hasMore: false, loadingOlder: false }
+    }
+    return directPaginationById[String(activeConversation.id)] || { hasMore: false, loadingOlder: false }
+  }, [activeConversation, directPaginationById, groupPaginationById])
 
   const groupMemberNames = useMemo(() => {
     if (activeConversationType !== 'group' || !activeChat?.members) return {}
@@ -96,6 +114,31 @@ function App() {
     })
   }
 
+  const forceScrollToBottom = (attempts = 6) => {
+    let count = 0
+    const run = () => {
+      const list = messageListRef.current
+      if (list) {
+        list.scrollTop = list.scrollHeight
+      }
+      count += 1
+      if (count < attempts) {
+        requestAnimationFrame(run)
+      }
+    }
+    requestAnimationFrame(run)
+  }
+
+  const mergeUniqueById = (prev = [], next = []) => {
+    const map = new Map()
+    ;[...prev, ...next].forEach((item) => {
+      if (item?.id !== undefined && item?.id !== null) {
+        map.set(item.id, item)
+      }
+    })
+    return Array.from(map.values())
+  }
+
   const clearAuthSession = (message = 'Session expired. Please login again.') => {
     socketRef.current?.disconnect()
     socketRef.current = null
@@ -104,8 +147,14 @@ function App() {
     setCurrentUser(null)
     setUsers([])
     setGroups([])
+    setUsersPage(1)
+    setGroupsPage(1)
+    setUsersHasMore(true)
+    setGroupsHasMore(true)
     setMessagesByUser({})
     setGroupMessagesById({})
+    setDirectPaginationById({})
+    setGroupPaginationById({})
     setActiveConversation(null)
     setError(message)
   }
@@ -177,27 +226,98 @@ function App() {
     return pickUploadedUrl(data)
   }
 
-  const fetchContacts = async (authToken = token) => {
-    const data = await apiFetch('/api/users', {}, authToken)
-    setUsers(data.users || [])
-    return data.users || []
+  const fetchContacts = async (authToken = token, options = {}) => {
+    const page = Number(options.page) > 0 ? Number(options.page) : 1
+    const append = Boolean(options.append)
+    const data = await apiFetch(`/api/users?page=${page}&limit=${CHAT_LIST_PAGE_SIZE}`, {}, authToken)
+    const incoming = data.users || []
+    setUsers((prev) => (append ? mergeUniqueById(prev, incoming) : incoming))
+    setUsersPage(page)
+    setUsersHasMore(Boolean(data.hasMore))
+    return incoming
   }
 
-  const fetchGroups = async (authToken = token) => {
-    const data = await apiFetch('/api/groups', {}, authToken)
-    setGroups(data.groups || [])
-    return data.groups || []
+  const fetchGroups = async (authToken = token, options = {}) => {
+    const page = Number(options.page) > 0 ? Number(options.page) : 1
+    const append = Boolean(options.append)
+    const data = await apiFetch(`/api/groups?page=${page}&limit=${CHAT_LIST_PAGE_SIZE}`, {}, authToken)
+    const incoming = data.groups || []
+    setGroups((prev) => (append ? mergeUniqueById(prev, incoming) : incoming))
+    setGroupsPage(page)
+    setGroupsHasMore(Boolean(data.hasMore))
+    return incoming
   }
 
-  const loadDirectConversation = async (id, authToken = token) => {
-    const data = await apiFetch(`/api/messages/${id}`, {}, authToken)
-    setMessagesByUser((prev) => ({ ...prev, [String(id)]: data.messages || [] }))
+  const loadDirectConversation = async (id, authToken = token, options = {}) => {
+    const appendOlder = Boolean(options.appendOlder)
+    const currentMeta = directPaginationById[String(id)] || { hasMore: true, loadingOlder: false, nextBeforeId: null, initialized: false }
+    if (appendOlder && (currentMeta.loadingOlder || !currentMeta.hasMore)) return false
+
+    const beforeId = appendOlder ? currentMeta.nextBeforeId : null
+    setDirectPaginationById((prev) => ({
+      ...prev,
+      [String(id)]: { ...currentMeta, loadingOlder: appendOlder ? true : false },
+    }))
+
+    const params = new URLSearchParams({ limit: String(MESSAGE_PAGE_SIZE) })
+    if (beforeId) params.set('beforeId', String(beforeId))
+    const data = await apiFetch(`/api/messages/${id}?${params.toString()}`, {}, authToken)
+    const incoming = data.messages || []
+
+    setMessagesByUser((prev) => {
+      const key = String(id)
+      const existing = prev[key] || []
+      return {
+        ...prev,
+        [key]: appendOlder ? [...incoming, ...existing] : incoming,
+      }
+    })
+    setDirectPaginationById((prev) => ({
+      ...prev,
+      [String(id)]: {
+        hasMore: Boolean(data.hasMore),
+        loadingOlder: false,
+        nextBeforeId: data.nextBeforeId || null,
+        initialized: true,
+      },
+    }))
+    return incoming.length > 0
   }
 
-  const loadGroupConversation = async (id, authToken = token) => {
-    const data = await apiFetch(`/api/groups/${id}/messages`, {}, authToken)
-    setGroupMessagesById((prev) => ({ ...prev, [String(id)]: data.messages || [] }))
+  const loadGroupConversation = async (id, authToken = token, options = {}) => {
+    const appendOlder = Boolean(options.appendOlder)
+    const currentMeta = groupPaginationById[String(id)] || { hasMore: true, loadingOlder: false, nextBeforeId: null, initialized: false }
+    if (appendOlder && (currentMeta.loadingOlder || !currentMeta.hasMore)) return false
+
+    const beforeId = appendOlder ? currentMeta.nextBeforeId : null
+    setGroupPaginationById((prev) => ({
+      ...prev,
+      [String(id)]: { ...currentMeta, loadingOlder: appendOlder ? true : false },
+    }))
+
+    const params = new URLSearchParams({ limit: String(MESSAGE_PAGE_SIZE) })
+    if (beforeId) params.set('beforeId', String(beforeId))
+    const data = await apiFetch(`/api/groups/${id}/messages?${params.toString()}`, {}, authToken)
+    const incoming = data.messages || []
+    setGroupMessagesById((prev) => {
+      const key = String(id)
+      const existing = prev[key] || []
+      return {
+        ...prev,
+        [key]: appendOlder ? [...incoming, ...existing] : incoming,
+      }
+    })
+    setGroupPaginationById((prev) => ({
+      ...prev,
+      [String(id)]: {
+        hasMore: Boolean(data.hasMore),
+        loadingOlder: false,
+        nextBeforeId: data.nextBeforeId || null,
+        initialized: true,
+      },
+    }))
     await markGroupSeen(id)
+    return incoming.length > 0
   }
 
   const markGroupSeen = async (groupId) => {
@@ -220,10 +340,63 @@ function App() {
       window.history.pushState({ mobileChatOpen: true, conversation }, '')
     }
     try {
-      if (conversation.type === 'group') await loadGroupConversation(conversation.id)
-      else await loadDirectConversation(conversation.id)
+      if (conversation.type === 'group') {
+        const meta = groupPaginationById[String(conversation.id)]
+        if (!meta?.initialized) await loadGroupConversation(conversation.id)
+      } else {
+        const meta = directPaginationById[String(conversation.id)]
+        if (!meta?.initialized) await loadDirectConversation(conversation.id)
+      }
+      suppressAutoScrollRef.current = false
+      forceScrollToBottom(8)
     } catch (e) {
       setError(e.message)
+    }
+  }
+
+  const loadOlderMessages = async () => {
+    if (!activeConversation) return
+    const listEl = messageListRef.current
+    const prevHeight = listEl?.scrollHeight || 0
+    const prevTop = listEl?.scrollTop || 0
+    suppressAutoScrollRef.current = true
+
+    try {
+      if (activeConversation.type === 'group') {
+        await loadGroupConversation(activeConversation.id, token, { appendOlder: true })
+      } else {
+        await loadDirectConversation(activeConversation.id, token, { appendOlder: true })
+      }
+
+      requestAnimationFrame(() => {
+        const node = messageListRef.current
+        if (node) {
+          const nextHeight = node.scrollHeight
+          node.scrollTop = nextHeight - prevHeight + prevTop
+        }
+        requestAnimationFrame(() => {
+          suppressAutoScrollRef.current = false
+        })
+      })
+    } catch (err) {
+      suppressAutoScrollRef.current = false
+      setError(err.message)
+    }
+  }
+
+  const loadMoreSidebarData = async () => {
+    if (loadingMoreSidebar) return
+    if (!usersHasMore && !groupsHasMore) return
+    setLoadingMoreSidebar(true)
+    try {
+      const tasks = []
+      if (usersHasMore) tasks.push(fetchContacts(token, { page: usersPage + 1, append: true }))
+      if (groupsHasMore) tasks.push(fetchGroups(token, { page: groupsPage + 1, append: true }))
+      await Promise.all(tasks)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setLoadingMoreSidebar(false)
     }
   }
 
@@ -270,14 +443,19 @@ function App() {
         const me = await apiFetch('/api/auth/me', {}, token)
         if (!mounted) return
         setCurrentUser(me.user)
-        const [fetchedUsers, fetchedGroups] = await Promise.all([fetchContacts(token), fetchGroups(token)])
+        const [fetchedUsers, fetchedGroups] = await Promise.all([
+          fetchContacts(token, { page: 1, append: false }),
+          fetchGroups(token, { page: 1, append: false }),
+        ])
         if (!mounted) return
         if (fetchedUsers[0]) {
           setActiveConversation({ type: 'direct', id: fetchedUsers[0].id })
           await loadDirectConversation(fetchedUsers[0].id, token)
+          forceScrollToBottom(8)
         } else if (fetchedGroups[0]) {
           setActiveConversation({ type: 'group', id: fetchedGroups[0].id })
           await loadGroupConversation(fetchedGroups[0].id, token)
+          forceScrollToBottom(8)
         }
 
         const socket = io(SOCKET_URL, { auth: { token }, transports: ['websocket'] })
@@ -345,6 +523,7 @@ function App() {
   }, [token])
 
   useEffect(() => {
+    if (suppressAutoScrollRef.current) return
     const list = messageListRef.current
     if (!list) return
     requestAnimationFrame(() => list.scrollTo({ top: list.scrollHeight, behavior: activeMessages.length <= 1 ? 'auto' : 'smooth' }))
@@ -429,7 +608,7 @@ function App() {
     setError('')
     try {
       const data = await apiFetch('/api/users/contacts', { method: 'POST', body: JSON.stringify({ identifier }) })
-      const contacts = await fetchContacts()
+      const contacts = await fetchContacts(token, { page: 1, append: false })
       if (data.contact?.id && contacts.some((c) => c.id === data.contact.id)) {
         await openConversation({ type: 'direct', id: data.contact.id })
       }
@@ -732,6 +911,8 @@ function App() {
           getLastMessageForGroup={getLastMessageForGroup}
           formatTime={formatTime}
           formatLastSeen={formatLastSeen}
+          onReachListEnd={loadMoreSidebarData}
+          loadingMoreSidebar={loadingMoreSidebar}
         />
 
         <ChatPanel
@@ -764,6 +945,9 @@ function App() {
           clearPendingMedia={clearPendingMedia}
           sendPendingMedia={sendPendingMedia}
           uploadingMedia={uploadingMedia}
+          hasOlderMessages={Boolean(activePaginationMeta.hasMore)}
+          loadingOlderMessages={Boolean(activePaginationMeta.loadingOlder)}
+          loadOlderMessages={loadOlderMessages}
           markConversationSeen={async (otherUserId) => {
             if (!otherUserId || seenRequestRef.current[otherUserId]) return
             seenRequestRef.current[otherUserId] = true

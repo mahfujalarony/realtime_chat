@@ -65,14 +65,24 @@ async function getMembership(groupId, userId) {
 
 router.get('/', authMiddleware, async (req, res) => {
   try {
-    const myMemberships = await GroupMember.findAll({
+    const requestedLimit = Number(req.query.limit)
+    const limit = Number.isInteger(requestedLimit) ? Math.max(10, Math.min(100, requestedLimit)) : 30
+    const requestedPage = Number(req.query.page)
+    const page = Number.isInteger(requestedPage) && requestedPage > 0 ? requestedPage : 1
+    const offset = (page - 1) * limit
+
+    const membershipRows = await GroupMember.findAndCountAll({
       where: { userId: req.user.id },
       attributes: ['groupId', 'lastReadAt'],
+      order: [['updatedAt', 'DESC']],
+      limit,
+      offset,
       raw: true,
     })
+    const myMemberships = membershipRows.rows || []
     const groupIds = myMemberships.map((item) => item.groupId)
 
-    if (groupIds.length === 0) return res.json({ groups: [] })
+    if (groupIds.length === 0) return res.json({ groups: [], page, limit, hasMore: false })
 
     const groups = await Group.findAll({
       where: { id: { [Op.in]: groupIds } },
@@ -131,7 +141,8 @@ router.get('/', authMiddleware, async (req, res) => {
         lastMessage: latestByGroupId[formatted.id] || null,
       }
     })
-    return res.json({ groups: output })
+    const hasMore = offset + myMemberships.length < Number(membershipRows.count || 0)
+    return res.json({ groups: output, page, limit, hasMore })
   } catch (error) {
     return res.status(500).json({ message: 'Failed to load groups', error: error.message })
   }
@@ -235,6 +246,10 @@ router.post('/', authMiddleware, async (req, res) => {
 router.get('/:groupId/messages', authMiddleware, async (req, res) => {
   try {
     const groupId = Number(req.params.groupId)
+    const requestedLimit = Number(req.query.limit)
+    const limit = Number.isInteger(requestedLimit) ? Math.max(10, Math.min(100, requestedLimit)) : 40
+    const beforeIdRaw = Number(req.query.beforeId)
+    const beforeId = Number.isInteger(beforeIdRaw) ? beforeIdRaw : null
     if (!Number.isInteger(groupId)) {
       return res.status(400).json({ message: 'Invalid groupId' })
     }
@@ -244,12 +259,27 @@ router.get('/:groupId/messages', authMiddleware, async (req, res) => {
       return res.status(403).json({ message: 'You are not a member of this group' })
     }
 
-    const messages = await GroupMessage.findAll({
-      where: { groupId },
-      order: [['createdAt', 'ASC']],
+    const where = { groupId }
+    if (beforeId) where.id = { [Op.lt]: beforeId }
+    const messagesDesc = await GroupMessage.findAll({
+      where,
+      order: [['id', 'DESC']],
+      limit,
     })
+    const messages = [...messagesDesc].reverse()
+    const oldestLoadedId = messages[0]?.id || null
+    const hasMore = Boolean(
+      oldestLoadedId &&
+        (await GroupMessage.findOne({
+          where: {
+            groupId,
+            id: { [Op.lt]: oldestLoadedId },
+          },
+          attributes: ['id'],
+        })),
+    )
 
-    return res.json({ messages: messages.map(formatGroupMessage) })
+    return res.json({ messages: messages.map(formatGroupMessage), hasMore, nextBeforeId: oldestLoadedId })
   } catch (error) {
     return res.status(500).json({ message: 'Failed to fetch group messages', error: error.message })
   }

@@ -67,6 +67,11 @@ function isProfileMediaUrlValidForUser(mediaUrl, uniqueUsername) {
 router.get('/', authMiddleware, async (req, res) => {
   try {
     const q = (req.query.q || '').trim()
+    const requestedLimit = Number(req.query.limit)
+    const limit = Number.isInteger(requestedLimit) ? Math.max(10, Math.min(100, requestedLimit)) : 30
+    const requestedPage = Number(req.query.page)
+    const page = Number.isInteger(requestedPage) && requestedPage > 0 ? requestedPage : 1
+    const offset = (page - 1) * limit
     const where = { userId: req.user.id }
     const contactUserWhere = {}
     if (q) {
@@ -78,7 +83,7 @@ router.get('/', authMiddleware, async (req, res) => {
       ]
     }
 
-    const contacts = await Contact.findAll({
+    const contactsResult = await Contact.findAndCountAll({
       where,
       include: [
         {
@@ -90,7 +95,10 @@ router.get('/', authMiddleware, async (req, res) => {
         },
       ],
       order: [[{ model: User, as: 'contactUser' }, 'username', 'ASC']],
+      limit,
+      offset,
     })
+    const contacts = contactsResult.rows || []
 
     const onlineUserSockets = req.app.get('onlineUserSockets') || new Map()
     const users = contacts.map((item) => {
@@ -124,7 +132,8 @@ router.get('/', authMiddleware, async (req, res) => {
       ...user,
       unreadCount: unreadBySenderId[user.id] || 0,
     }))
-    return res.json({ users: withUnread })
+    const hasMore = offset + contacts.length < Number(contactsResult.count || 0)
+    return res.json({ users: withUnread, page, limit, hasMore })
   } catch (error) {
     return res.status(500).json({ message: 'Failed to load users', error: error.message })
   }

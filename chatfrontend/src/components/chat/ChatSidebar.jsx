@@ -25,6 +25,8 @@ function ChatSidebar({
   getLastMessageForGroup,
   formatTime,
   formatLastSeen,
+  onReachListEnd,
+  loadingMoreSidebar,
 }) {
   const [isAddContactOpen, setIsAddContactOpen] = useState(false)
   const [isMyProfileOpen, setIsMyProfileOpen] = useState(false)
@@ -181,7 +183,14 @@ function ChatSidebar({
 
       {error ? <p className="m-3 rounded-md bg-red-100 px-3 py-2 text-xs text-red-700">{error}</p> : null}
 
-      <ul className="flex-1 min-h-0 overflow-y-auto">
+      <ul
+        className="flex-1 min-h-0 overflow-y-auto"
+        onScroll={(event) => {
+          const el = event.currentTarget
+          const nearBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 120
+          if (nearBottom) onReachListEnd?.()
+        }}
+      >
         <li className="px-4 pt-3 text-[11px] font-semibold uppercase tracking-wide text-[#667781]">Direct chats</li>
         {filteredUsers.length === 0 ? (
           <li className="px-4 py-2">
@@ -315,6 +324,10 @@ function ChatSidebar({
           )
         })}
       </ul>
+
+      {loadingMoreSidebar ? (
+        <div className="border-t border-[#e7ecef] px-4 py-2 text-center text-[11px] text-[#667781]">Loading more chats...</div>
+      ) : null}
 
       {isAddContactOpen ? (
         <section className="absolute inset-0 z-30 bg-white">
