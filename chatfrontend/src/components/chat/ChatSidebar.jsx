@@ -1,4 +1,4 @@
-import { ArrowLeft, Camera, EllipsisVertical, LogOut, MessageCirclePlus, Search, UserPlus, Users } from 'lucide-react'
+import { ArrowLeft, Camera, EllipsisVertical, LogOut, MessageCirclePlus, Phone, Search, UserPlus, Users, Video } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 
 function ChatSidebar({
@@ -22,6 +22,8 @@ function ChatSidebar({
   getLastMessageForUser,
   formatTime,
   formatLastSeen,
+  onQuickAudioCall,
+  onQuickVideoCall,
   onReachListEnd,
   loadingMoreSidebar,
 }) {
@@ -181,14 +183,14 @@ function ChatSidebar({
       {error ? <p className="m-3 rounded-md bg-red-100 px-3 py-2 text-xs text-red-700">{error}</p> : null}
 
       <ul
-        className="flex-1 min-h-0 overflow-y-auto"
+        className="flex-1 min-h-0 overflow-y-auto bg-[#f4f6f8] px-2 pb-2"
         onScroll={(event) => {
           const el = event.currentTarget
           const nearBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 120
           if (nearBottom) onReachListEnd?.()
         }}
       >
-        <li className="px-4 pt-3 text-[11px] font-semibold uppercase tracking-wide text-[#667781]">Direct chats</li>
+        <li className="px-3 pt-3 text-[11px] font-semibold uppercase tracking-wide text-[#667781]">Direct chats</li>
         {filteredUsers.length === 0 ? (
           <li className="px-4 py-2">
             <div className="rounded-xl border border-[#e3e9ec] bg-[#f7fbfd] p-3">
@@ -214,15 +216,20 @@ function ChatSidebar({
         {filteredUsers.map((chatUser) => {
           const lastMessage = getLastMessageForUser(chatUser.id)
           return (
-            <li key={`direct-${chatUser.id}`}>
-              <button
-                type="button"
-                onClick={() => openConversation({ type: 'direct', id: chatUser.id })}
-                className={`w-full cursor-pointer border-b border-[#ececec] px-4 py-3 text-left transition ${
-                  isActiveConversation('direct', chatUser.id) ? 'bg-[#ebf8f1]' : 'hover:bg-[#f2f3f5]'
+            <li key={`direct-${chatUser.id}`} className="px-1 py-1.5">
+              <div
+                className={`rounded-2xl border px-3 py-3 shadow-[0_1px_2px_rgba(17,27,33,0.04)] transition ${
+                  isActiveConversation('direct', chatUser.id)
+                    ? 'border-[#b8e9cc] bg-[#ebf8f1]'
+                    : 'border-[#e3e9ed] bg-white hover:bg-[#f7fafc]'
                 }`}
               >
                 <div className="flex items-start gap-3">
+                  <button
+                    type="button"
+                    onClick={() => openConversation({ type: 'direct', id: chatUser.id })}
+                    className="flex min-w-0 flex-1 items-start gap-3 text-left"
+                  >
                   <div className="h-11 w-11 overflow-hidden rounded-full bg-[#d0d7db]">
                     {chatUser.profileMediaUrl ? (
                       <img
@@ -255,8 +262,35 @@ function ChatSidebar({
                       {chatUser.isOnline ? 'online' : formatLastSeen(chatUser.lastSeen)}
                     </p>
                   </div>
+                  </button>
+                  <div className="mt-1 flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        onQuickAudioCall?.(chatUser)
+                      }}
+                      className="rounded-full p-1.5 text-[#54656f] transition hover:bg-[#e7ecef]"
+                      title="Audio call"
+                      aria-label={`Audio call ${chatUser.username}`}
+                    >
+                      <Phone size={15} />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        onQuickVideoCall?.(chatUser)
+                      }}
+                      className="rounded-full p-1.5 text-[#54656f] transition hover:bg-[#e7ecef]"
+                      title="Video call"
+                      aria-label={`Video call ${chatUser.username}`}
+                    >
+                      <Video size={15} />
+                    </button>
+                  </div>
                 </div>
-              </button>
+              </div>
             </li>
           )
         })}
@@ -320,34 +354,38 @@ function ChatSidebar({
             ) : null}
             {!lookupLoading && lookupResult?.user && !lookupResult?.isSelf ? (
               <div className="rounded-lg border border-[#e1e7eb] bg-[#f8fbfd] px-3 py-2">
-                <p className="text-xs text-[#667781]">This person is available on chat.</p>
-                <div className="mt-2 flex items-center gap-3">
-                  <div className="h-11 w-11 overflow-hidden rounded-full bg-[#d0d7db]">
-                    {lookupResult.user.profileMediaUrl ? (
-                      <img
-                        src={lookupResult.user.profileMediaUrl}
-                        alt={lookupResult.user.username}
-                        className="h-full w-full object-cover"
-                      />
-                    ) : (
-                      <div className="flex h-full w-full items-center justify-center text-sm font-semibold text-[#30424f]">
-                        {getInitials(lookupResult.user.username)}
-                      </div>
-                    )}
-                  </div>
+                <div className="flex items-center justify-between gap-3">
                   <div className="min-w-0">
-                    <p className="truncate text-sm font-semibold text-[#1f2c34]">{lookupResult.user.username}</p>
-                    <p className="truncate text-[11px] text-[#667781]">{lookupResult.user.uniqueUsername || ''}</p>
+                    <p className="text-xs text-[#667781]">This person is available on chat.</p>
+                    <div className="mt-2 flex min-w-0 items-center gap-3">
+                      <div className="h-11 w-11 overflow-hidden rounded-full bg-[#d0d7db]">
+                        {lookupResult.user.profileMediaUrl ? (
+                          <img
+                            src={lookupResult.user.profileMediaUrl}
+                            alt={lookupResult.user.username}
+                            className="h-full w-full object-cover"
+                          />
+                        ) : (
+                          <div className="flex h-full w-full items-center justify-center text-sm font-semibold text-[#30424f]">
+                            {getInitials(lookupResult.user.username)}
+                          </div>
+                        )}
+                      </div>
+                      <div className="min-w-0">
+                        <p className="truncate text-sm font-semibold text-[#1f2c34]">{lookupResult.user.username}</p>
+                        <p className="truncate text-[11px] text-[#667781]">{lookupResult.user.uniqueUsername || ''}</p>
+                      </div>
+                    </div>
                   </div>
+                  <button
+                    type="button"
+                    onClick={handleLookupAction}
+                    disabled={addingContact}
+                    className="shrink-0 rounded-md bg-[#25d366] px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-60"
+                  >
+                    {addingContact ? 'Please wait...' : lookupResult.alreadyContact ? 'Send message' : 'Add contact'}
+                  </button>
                 </div>
-                <button
-                  type="button"
-                  onClick={handleLookupAction}
-                  disabled={addingContact}
-                  className="mt-2 rounded-md bg-[#25d366] px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-60"
-                >
-                  {addingContact ? 'Please wait...' : lookupResult.alreadyContact ? 'Send message' : 'Add contact'}
-                </button>
               </div>
             ) : null}
             {!lookupLoading && !lookupResult?.user && lookupMessage ? (

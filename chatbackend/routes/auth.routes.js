@@ -1,9 +1,9 @@
 const express = require('express')
 const { Op } = require('sequelize')
 const authMiddleware = require('../middleware/auth')
-const { User } = require('../models')
+const { User, sequelize } = require('../models')
 const { signToken } = require('../utils/token')
-const { ensureUserFolder } = require('../utils/upload-server')
+const { ensureUserFolder, deleteUserFolder } = require('../utils/upload-server')
 const { buildUnusedUniqueUsername, ensureUserUniqueUsername } = require('../utils/user-identity')
 
 const router = express.Router()
@@ -58,15 +58,26 @@ router.post('/register', async (req, res) => {
       })
     }
 
-    const user = await User.create({
-      username,
-      uniqueUsername,
-      email: email || null,
-      mobileNumber: mobileNumber || null,
-      dateOfBirth,
-      passwordHash: password,
-      lastSeen: new Date(),
-    })
+    let user
+    try {
+      user = await sequelize.transaction(async (t) =>
+        User.create(
+          {
+            username,
+            uniqueUsername,
+            email: email || null,
+            mobileNumber: mobileNumber || null,
+            dateOfBirth,
+            passwordHash: password,
+            lastSeen: new Date(),
+          },
+          { transaction: t },
+        ),
+      )
+    } catch (dbError) {
+      await deleteUserFolder(uniqueUsername).catch(() => null)
+      throw dbError
+    }
 
     const token = signToken(user.id)
     return res.status(201).json({
@@ -76,6 +87,26 @@ router.post('/register', async (req, res) => {
     })
   } catch (error) {
     return res.status(500).json({ message: 'Registration failed', error: error.message })
+  }
+})
+
+router.post('/rollback-registration', authMiddleware, async (req, res) => {
+  try {
+    const userId = Number(req.user?.id)
+    const uniqueUsername = req.user?.uniqueUsername || req.user?.username
+
+    if (!Number.isInteger(userId) || !uniqueUsername) {
+      return res.status(400).json({ message: 'Invalid rollback context' })
+    }
+
+    await sequelize.transaction(async (t) => {
+      await User.destroy({ where: { id: userId }, transaction: t })
+    })
+    await deleteUserFolder(uniqueUsername).catch(() => null)
+
+    return res.json({ message: 'Registration rolled back' })
+  } catch (error) {
+    return res.status(500).json({ message: 'Rollback failed', error: error.message })
   }
 })
 

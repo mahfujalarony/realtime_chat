@@ -1,5 +1,5 @@
 const express = require('express')
-const { Op } = require('sequelize')
+const { Op, QueryTypes } = require('sequelize')
 const authMiddleware = require('../middleware/auth')
 const { User, Contact, Message, sequelize } = require('../models')
 const { UPLOAD_SERVER_URL } = require('../utils/upload-server')
@@ -31,8 +31,13 @@ async function resolveUserByIdentifier(identifier) {
 
 function extractUploadProfilePath(mediaUrl) {
   try {
-    const parsed = new URL(mediaUrl)
-    const pathname = decodeURIComponent(parsed.pathname)
+    const raw = String(mediaUrl || '').trim()
+    if (!raw) return null
+    const pathname = decodeURIComponent(
+      raw.startsWith('/')
+        ? raw
+        : new URL(raw).pathname,
+    )
     const match = pathname.match(/\/uploads\/chat\/([^/]+)\/profile\/([^/]+)$/)
     if (!match) return null
     return {
@@ -55,8 +60,13 @@ async function deleteProfileMediaFromUploadServer(mediaUrl) {
 
 function isProfileMediaUrlValidForUser(mediaUrl, uniqueUsername) {
   try {
-    const parsed = new URL(mediaUrl)
-    const pathname = decodeURIComponent(parsed.pathname).toLowerCase()
+    const raw = String(mediaUrl || '').trim()
+    if (!raw) return false
+    const pathname = decodeURIComponent(
+      raw.startsWith('/')
+        ? raw
+        : new URL(raw).pathname,
+    ).toLowerCase()
     const userPath = `/chat/${String(uniqueUsername).toLowerCase()}/`
     return pathname.includes(`${userPath}profile/`)
   } catch (error) {
@@ -72,68 +82,105 @@ router.get('/', authMiddleware, async (req, res) => {
     const requestedPage = Number(req.query.page)
     const page = Number.isInteger(requestedPage) && requestedPage > 0 ? requestedPage : 1
     const offset = (page - 1) * limit
-    const where = { userId: req.user.id }
-    const contactUserWhere = {}
-    if (q) {
-      contactUserWhere[Op.or] = [
-        { username: { [Op.like]: `%${q}%` } },
-        { uniqueUsername: { [Op.like]: `%${q}%` } },
-        { email: { [Op.like]: `%${q}%` } },
-        { mobileNumber: { [Op.like]: `%${q}%` } },
-      ]
-    }
+    const likeQ = `%${q}%`
 
-    const contactsResult = await Contact.findAndCountAll({
-      where,
-      include: [
-        {
-          model: User,
-          as: 'contactUser',
-          attributes: ['id', 'username', 'uniqueUsername', 'email', 'mobileNumber', 'lastSeen', 'profileMediaUrl', 'createdAt'],
-          where: contactUserWhere,
-          required: true,
+    const filterClause = q
+      ? `AND (
+          u.username LIKE :likeQ
+          OR u.unique_username LIKE :likeQ
+          OR u.email LIKE :likeQ
+          OR u.mobile_number LIKE :likeQ
+        )`
+      : ''
+
+    const [{ total = 0 } = { total: 0 }] = await sequelize.query(
+      `
+      SELECT COUNT(*) AS total
+      FROM contacts c
+      INNER JOIN users u ON u.id = c.contact_user_id
+      WHERE c.user_id = :currentUserId
+      ${filterClause}
+      `,
+      {
+        replacements: { currentUserId: req.user.id, likeQ },
+        type: QueryTypes.SELECT,
+      },
+    )
+
+    const rows = await sequelize.query(
+      `
+      SELECT
+        u.id AS id,
+        u.username AS username,
+        u.unique_username AS uniqueUsername,
+        u.email AS email,
+        u.mobile_number AS mobileNumber,
+        u.last_seen AS lastSeen,
+        u.profile_media_url AS profileMediaUrl,
+        u.created_at AS createdAt,
+        (
+          SELECT MAX(m.created_at)
+          FROM messages m
+          WHERE
+            (m.sender_id = :currentUserId AND m.receiver_id = u.id)
+            OR
+            (m.sender_id = u.id AND m.receiver_id = :currentUserId)
+        ) AS lastMessageAt,
+        (
+          SELECT COUNT(*)
+          FROM messages um
+          WHERE
+            um.receiver_id = :currentUserId
+            AND um.sender_id = u.id
+            AND um.seen = 0
+        ) AS unreadCount
+      FROM contacts c
+      INNER JOIN users u ON u.id = c.contact_user_id
+      WHERE c.user_id = :currentUserId
+      ${filterClause}
+      ORDER BY
+        CASE
+          WHEN (
+            SELECT MAX(m2.created_at)
+            FROM messages m2
+            WHERE
+              (m2.sender_id = :currentUserId AND m2.receiver_id = u.id)
+              OR
+              (m2.sender_id = u.id AND m2.receiver_id = :currentUserId)
+          ) IS NULL THEN 1
+          ELSE 0
+        END ASC,
+        (
+          SELECT MAX(m3.created_at)
+          FROM messages m3
+          WHERE
+            (m3.sender_id = :currentUserId AND m3.receiver_id = u.id)
+            OR
+            (m3.sender_id = u.id AND m3.receiver_id = :currentUserId)
+        ) DESC,
+        u.username ASC
+      LIMIT :limit OFFSET :offset
+      `,
+      {
+        replacements: {
+          currentUserId: req.user.id,
+          likeQ,
+          limit,
+          offset,
         },
-      ],
-      order: [[{ model: User, as: 'contactUser' }, 'username', 'ASC']],
-      limit,
-      offset,
-    })
-    const contacts = contactsResult.rows || []
+        type: QueryTypes.SELECT,
+      },
+    )
 
     const onlineUserSockets = req.app.get('onlineUserSockets') || new Map()
-    const users = contacts.map((item) => {
-      const user = item.contactUser.toJSON()
-      return {
-        ...user,
-        isOnline: onlineUserSockets.has(user.id),
-      }
-    })
-
-    const contactIds = users.map((u) => u.id)
-    let unreadBySenderId = {}
-    if (contactIds.length > 0) {
-      const unreadRows = await Message.findAll({
-        where: {
-          receiverId: req.user.id,
-          seen: false,
-          senderId: { [Op.in]: contactIds },
-        },
-        attributes: ['senderId', [sequelize.fn('COUNT', sequelize.col('id')), 'unreadCount']],
-        group: ['senderId'],
-        raw: true,
-      })
-      unreadBySenderId = unreadRows.reduce((acc, row) => {
-        acc[Number(row.senderId)] = Number(row.unreadCount) || 0
-        return acc
-      }, {})
-    }
-
-    const withUnread = users.map((user) => ({
-      ...user,
-      unreadCount: unreadBySenderId[user.id] || 0,
+    const users = rows.map((row) => ({
+      ...row,
+      unreadCount: Number(row.unreadCount) || 0,
+      isOnline: onlineUserSockets.has(Number(row.id)),
     }))
-    const hasMore = offset + contacts.length < Number(contactsResult.count || 0)
-    return res.json({ users: withUnread, page, limit, hasMore })
+
+    const hasMore = offset + users.length < Number(total || 0)
+    return res.json({ users, page, limit, hasMore })
   } catch (error) {
     return res.status(500).json({ message: 'Failed to load users', error: error.message })
   }

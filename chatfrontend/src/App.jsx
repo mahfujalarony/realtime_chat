@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { io } from 'socket.io-client'
-import { Phone, PhoneOff, Video } from 'lucide-react'
+import { Camera, Mic, Phone, PhoneOff, Video } from 'lucide-react'
 import AuthScreen from './components/chat/AuthScreen'
 import ChatSidebar from './components/chat/ChatSidebar'
 import ChatPanel from './components/chat/ChatPanel'
@@ -10,9 +10,10 @@ import ZegoCallModal from './components/chat/ZegoCallModal'
 import './App.css'
 
 const runtimeHost = typeof window !== 'undefined' ? window.location.hostname : 'localhost'
-const API_URL = import.meta.env.VITE_API_URL || `http://${runtimeHost}:5000`
-const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || API_URL
-const UPLOAD_SERVER_URL = import.meta.env.VITE_UPLOAD_SERVER_URL || `http://${runtimeHost}:5001`
+const sameOriginBase = typeof window !== 'undefined' ? window.location.origin : `http://${runtimeHost}:5173`
+const API_URL = import.meta.env.VITE_API_URL || ''
+const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || sameOriginBase
+const UPLOAD_SERVER_URL = import.meta.env.VITE_UPLOAD_SERVER_URL || ''
 const UPLOAD_FILE_FIELD = import.meta.env.VITE_UPLOAD_FILE_FIELD || 'file'
 const CHAT_LIST_PAGE_SIZE = 30
 const MESSAGE_PAGE_SIZE = 40
@@ -59,6 +60,7 @@ function App() {
   const [incomingCall, setIncomingCall] = useState(null)
   const [outgoingCall, setOutgoingCall] = useState(null)
   const [activeCall, setActiveCall] = useState(null)
+  const [permissionHelp, setPermissionHelp] = useState(null)
 
   const [loginForm, setLoginForm] = useState({ identifier: '', password: '' })
   const [registerForm, setRegisterForm] = useState({
@@ -76,6 +78,10 @@ function App() {
   const serviceWorkerRegRef = useRef(null)
   const ringtoneIntervalRef = useRef(null)
   const ringtoneAudioContextRef = useRef(null)
+  const ringtoneElementRef = useRef(null)
+  const incomingAlertTokenRef = useRef(0)
+  const outgoingRingIntervalRef = useRef(null)
+  const outgoingRingAudioContextRef = useRef(null)
   const hasPushSubscribedRef = useRef(false)
 
   const activeConversationType = activeConversation?.type || null
@@ -139,11 +145,17 @@ function App() {
   }
 
   const stopIncomingAlert = () => {
+    incomingAlertTokenRef.current += 1
     if (ringtoneIntervalRef.current) {
       clearInterval(ringtoneIntervalRef.current)
       ringtoneIntervalRef.current = null
     }
     if (navigator.vibrate) navigator.vibrate(0)
+    if (ringtoneElementRef.current) {
+      ringtoneElementRef.current.pause()
+      ringtoneElementRef.current.currentTime = 0
+      ringtoneElementRef.current = null
+    }
     if (ringtoneAudioContextRef.current) {
       ringtoneAudioContextRef.current.close().catch(() => null)
       ringtoneAudioContextRef.current = null
@@ -152,7 +164,9 @@ function App() {
 
   const playIncomingAlert = () => {
     stopIncomingAlert()
-    try {
+    const alertToken = incomingAlertTokenRef.current
+    const startBeepFallback = () => {
+      if (alertToken !== incomingAlertTokenRef.current) return
       const AudioCtx = window.AudioContext || window.webkitAudioContext
       if (!AudioCtx) return
       const audioContext = new AudioCtx()
@@ -175,8 +189,129 @@ function App() {
       playPulse()
       ringtoneIntervalRef.current = setInterval(playPulse, 1300)
       if (navigator.vibrate) navigator.vibrate([250, 120, 250, 120])
+    }
+
+    const ringtonePath = '/sounds/incoming-call.mp3'
+    try {
+      const audio = new Audio(ringtonePath)
+      audio.loop = true
+      audio.preload = 'auto'
+      const playPromise = audio.play()
+      if (playPromise && typeof playPromise.then === 'function') {
+        playPromise
+          .then(() => {
+            if (alertToken !== incomingAlertTokenRef.current) {
+              audio.pause()
+              audio.currentTime = 0
+              return
+            }
+            ringtoneElementRef.current = audio
+            if (navigator.vibrate) navigator.vibrate([250, 120, 250, 120])
+          })
+          .catch(() => {
+            ringtoneElementRef.current = null
+            startBeepFallback()
+          })
+      } else {
+        ringtoneElementRef.current = audio
+        if (navigator.vibrate) navigator.vibrate([250, 120, 250, 120])
+      }
+      return
+    } catch {
+      // fallback below
+    }
+
+    try {
+      startBeepFallback()
     } catch {
       // ignore if autoplay policy blocks audio context
+    }
+  }
+
+  const stopOutgoingAlert = () => {
+    if (outgoingRingIntervalRef.current) {
+      clearInterval(outgoingRingIntervalRef.current)
+      outgoingRingIntervalRef.current = null
+    }
+    if (outgoingRingAudioContextRef.current) {
+      outgoingRingAudioContextRef.current.close().catch(() => null)
+      outgoingRingAudioContextRef.current = null
+    }
+  }
+
+  const playOutgoingAlert = () => {
+    stopOutgoingAlert()
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext
+      if (!AudioCtx) return
+      const audioContext = new AudioCtx()
+      outgoingRingAudioContextRef.current = audioContext
+
+      const playPulse = () => {
+        const now = audioContext.currentTime
+        const osc = audioContext.createOscillator()
+        const gainNode = audioContext.createGain()
+        osc.type = 'sine'
+        osc.frequency.setValueAtTime(510, now)
+        gainNode.gain.setValueAtTime(0.0001, now)
+        gainNode.gain.exponentialRampToValueAtTime(0.12, now + 0.03)
+        gainNode.gain.exponentialRampToValueAtTime(0.0001, now + 0.26)
+        osc.connect(gainNode)
+        gainNode.connect(audioContext.destination)
+        osc.start(now)
+        osc.stop(now + 0.3)
+      }
+
+      playPulse()
+      outgoingRingIntervalRef.current = setInterval(playPulse, 1200)
+    } catch {
+      // ignore autoplay blocked case
+    }
+  }
+
+  const closePermissionHelp = () => setPermissionHelp(null)
+  const retryPermissionCheck = async () => {
+    if (!permissionHelp) return
+    const ok = await ensureCallDevicePermission(permissionHelp.callType || 'video')
+    if (ok) setPermissionHelp(null)
+  }
+
+  const ensureCallDevicePermission = async (type = 'video') => {
+    const needCamera = type !== 'audio'
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setPermissionHelp({
+        callType: type,
+        title: 'This browser does not support calling',
+        message: 'Your browser does not support microphone/camera access.',
+      })
+      return false
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: needCamera,
+      })
+      stream.getTracks().forEach((track) => track.stop())
+      return true
+    } catch (error) {
+      const errName = String(error?.name || '').toLowerCase()
+      const blocked = errName.includes('notallowed') || errName.includes('permission')
+      const missing = errName.includes('notfound') || errName.includes('overconstrained')
+      const title = blocked
+        ? `${needCamera ? 'Camera + microphone' : 'Microphone'} permission is blocked`
+        : missing
+          ? `${needCamera ? 'Camera or microphone' : 'Microphone'} not found`
+          : `Cannot access ${needCamera ? 'camera/microphone' : 'microphone'}`
+
+      setPermissionHelp({
+        callType: type,
+        title,
+        message: blocked
+          ? `Please allow ${needCamera ? 'camera and microphone' : 'microphone'} in browser site settings, then try again.`
+          : 'Please check device availability and browser permissions, then try again.',
+      })
+      return false
     }
   }
 
@@ -229,6 +364,7 @@ function App() {
 
   const clearAuthSession = (message = 'Session expired. Please login again.') => {
     stopIncomingAlert()
+    stopOutgoingAlert()
     socketRef.current?.disconnect()
     socketRef.current = null
     localStorage.removeItem('chat_token')
@@ -459,11 +595,31 @@ function App() {
     const timer = setTimeout(() => {
       setOutgoingCall((prev) => {
         if (!prev || prev.roomId !== outgoingCall.roomId) return prev
+        if (prev.peerUser?.id) {
+          socketRef.current?.emit('call:cancel', {
+            toUserId: prev.peerUser.id,
+            roomId: prev.roomId,
+            reason: 'no-answer',
+          })
+        }
         setError('No answer from other user')
         return null
       })
     }, 45000)
     return () => clearTimeout(timer)
+  }, [outgoingCall])
+
+  useEffect(() => {
+    if (!outgoingCall) {
+      stopOutgoingAlert()
+      return
+    }
+    if (outgoingCall.status === 'calling' || outgoingCall.status === 'ringing') {
+      playOutgoingAlert()
+      return () => stopOutgoingAlert()
+    }
+    stopOutgoingAlert()
+    return undefined
   }, [outgoingCall])
 
   useEffect(() => {
@@ -515,9 +671,17 @@ function App() {
             if (list.some((m) => m.id === message.id)) return prev
             return { ...prev, [key]: [...list, message] }
           })
-          if (!isFromMe && !(activeConversation?.type === 'direct' && Number(activeConversation.id) === Number(otherId))) {
-            setUsers((prev) => prev.map((u) => (u.id === otherId ? { ...u, unreadCount: (Number(u.unreadCount) || 0) + 1 } : u)))
-          }
+          setUsers((prev) =>
+            prev.map((u) => {
+              if (u.id !== otherId) return u
+              const shouldIncreaseUnread = !isFromMe && !(activeConversation?.type === 'direct' && Number(activeConversation.id) === Number(otherId))
+              return {
+                ...u,
+                lastMessageAt: message.createdAt || new Date().toISOString(),
+                unreadCount: shouldIncreaseUnread ? (Number(u.unreadCount) || 0) + 1 : Number(u.unreadCount) || 0,
+              }
+            }),
+          )
         })
         socket.on('chat:presence', (payload) => {
           setUsers((prev) => prev.map((u) => (u.id === payload.userId ? { ...u, isOnline: payload.isOnline, lastSeen: payload.lastSeen } : u)))
@@ -542,6 +706,16 @@ function App() {
             roomId: payload?.roomId,
           })
         })
+        socket.on('call:busy', (payload) => {
+          const busyUser = payload?.byUser?.username || 'User'
+          const busyMessage = payload?.message || `${busyUser} is busy on another call`
+          setOutgoingCall((prev) => {
+            if (!prev) return prev
+            if (payload?.roomId && prev.roomId !== payload.roomId) return prev
+            return null
+          })
+          setError(busyMessage)
+        })
         socket.on('call:ringing', (payload) => {
           setOutgoingCall((prev) => {
             if (!prev || prev.roomId !== payload?.roomId) return prev
@@ -557,6 +731,7 @@ function App() {
                 callType: prev.callType,
                 status: 'connected',
                 peerUser: prev.peerUser,
+                startedAt: Date.now(),
               })
               return null
             })
@@ -566,11 +741,34 @@ function App() {
             setIncomingCall((prev) => (prev?.roomId === payload?.roomId ? null : prev))
             setOutgoingCall((prev) => {
               if (!prev || prev.roomId !== payload?.roomId) return prev
-              setError(`${payload?.byUser?.username || 'User'} declined the call`)
+              const reason = String(payload?.reason || '')
+              if (reason === 'busy') setError(`${payload?.byUser?.username || 'User'} is busy`)
+              else setError(`${payload?.byUser?.username || 'User'} declined the call`)
               return null
             })
             setActiveCall(null)
           }
+        })
+        socket.on('call:canceled', (payload) => {
+          const roomId = payload?.roomId
+          if (!roomId) return
+          setIncomingCall((prev) => (prev?.roomId === roomId ? null : prev))
+          setOutgoingCall((prev) => {
+            if (!prev || prev.roomId !== roomId) return prev
+            return null
+          })
+          if (String(payload?.reason || '') === 'no-answer') {
+            setError('No answer from other user')
+          } else if (payload?.byUser?.username) {
+            setError(`${payload.byUser.username} canceled the call`)
+          }
+        })
+        socket.on('call:ended', (payload) => {
+          const roomId = payload?.roomId
+          if (!roomId) return
+          setIncomingCall((prev) => (prev?.roomId === roomId ? null : prev))
+          setOutgoingCall((prev) => (prev?.roomId === roomId ? null : prev))
+          setActiveCall((prev) => (prev?.roomId === roomId ? null : prev))
         })
         socketRef.current = socket
       } catch (e) {
@@ -583,6 +781,7 @@ function App() {
     return () => {
       mounted = false
       stopIncomingAlert()
+      stopOutgoingAlert()
       socketRef.current?.disconnect()
       socketRef.current = null
     }
@@ -602,9 +801,29 @@ function App() {
 
   const filteredUsers = useMemo(() => {
     const q = searchQuery.trim().toLowerCase()
-    if (!q) return users
-    return users.filter((u) => u.username.toLowerCase().includes(q) || (u.email || '').toLowerCase().includes(q) || (u.mobileNumber || '').toLowerCase().includes(q))
-  }, [users, searchQuery])
+    const filtered = !q
+      ? [...users]
+      : users.filter((u) => u.username.toLowerCase().includes(q) || (u.email || '').toLowerCase().includes(q) || (u.mobileNumber || '').toLowerCase().includes(q))
+
+    const getUserSortTime = (user) => {
+      const list = messagesByUser[String(user.id)] || []
+      const lastLoadedMessage = list[list.length - 1]
+      const candidates = [lastLoadedMessage?.createdAt, user.lastMessageAt, user.updatedAt, user.createdAt]
+      for (const value of candidates) {
+        const ts = new Date(value || '').getTime()
+        if (Number.isFinite(ts) && ts > 0) return ts
+      }
+      return 0
+    }
+
+    filtered.sort((a, b) => {
+      const diff = getUserSortTime(b) - getUserSortTime(a)
+      if (diff !== 0) return diff
+      return String(a.username || '').localeCompare(String(b.username || ''))
+    })
+
+    return filtered
+  }, [users, searchQuery, messagesByUser])
 
   const getInitials = (name = '') => name.split(' ').map((p) => p[0]).join('').slice(0, 2).toUpperCase()
   const formatTime = (value) => (value ? new Date(value).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '')
@@ -645,9 +864,12 @@ function App() {
     e.preventDefault()
     setSubmitting(true)
     setError('')
+    let rollbackToken = ''
+    let rollbackRequested = false
     try {
       const payload = { ...registerForm, email: registerForm.email || undefined, mobileNumber: registerForm.mobileNumber || undefined }
       const data = await apiFetch('/api/auth/register', { method: 'POST', body: JSON.stringify(payload) }, '')
+      rollbackToken = data?.token || ''
       if (registerProfileFile) {
         const uniqueUsername = data?.user?.uniqueUsername || data?.user?.username
         const profileMediaUrl = await uploadToExternalServer(registerProfileFile, 'profile', uniqueUsername)
@@ -658,7 +880,12 @@ function App() {
       setRegisterForm({ username: '', email: '', mobileNumber: '', dateOfBirth: '', password: '' })
       setRegisterProfileFile(null)
     } catch (err) {
-      setError(err.message)
+      if (rollbackToken) {
+        rollbackRequested = true
+        await apiFetch('/api/auth/rollback-registration', { method: 'POST' }, rollbackToken).catch(() => null)
+      }
+      const rollbackNote = rollbackRequested ? ' Registration data was rolled back. Please try again.' : ''
+      setError(`${err.message}${rollbackNote}`)
     } finally {
       setSubmitting(false)
     }
@@ -705,6 +932,9 @@ function App() {
       const key = String(activeConversation.id)
       return { ...prev, [key]: [...(prev[key] || []), temp] }
     })
+    setUsers((prev) =>
+      prev.map((u) => (u.id === activeConversation.id ? { ...u, lastMessageAt: temp.createdAt } : u)),
+    )
     setDraftMessage('')
 
     const socket = socketRef.current
@@ -759,6 +989,9 @@ function App() {
         if (list.some((m) => m.id === data.message?.id)) return prev
         return { ...prev, [key]: [...list, data.message] }
       })
+      setUsers((prev) =>
+        prev.map((u) => (u.id === activeConversation.id ? { ...u, lastMessageAt: data.message?.createdAt || new Date().toISOString() } : u)),
+      )
     } catch (err) {
       setError(err.message)
     } finally {
@@ -846,6 +1079,24 @@ function App() {
     })
   }
 
+  const deleteMessages = async (messageIds = []) => {
+    if (!activeConversation || activeConversation.type !== 'direct') return
+    const normalized = Array.from(
+      new Set(
+        (Array.isArray(messageIds) ? messageIds : [])
+          .map((id) => Number(id))
+          .filter((id) => Number.isInteger(id)),
+      ),
+    )
+    if (!normalized.length) return
+    await Promise.all(normalized.map((id) => apiFetch(`/api/messages/${id}`, { method: 'DELETE' })))
+    setMessagesByUser((prev) => {
+      const key = String(activeConversation.id)
+      const removeSet = new Set(normalized)
+      return { ...prev, [key]: (prev[key] || []).filter((m) => !removeSet.has(Number(m.id))) }
+    })
+  }
+
   const clearChat = async () => {
     if (!activeConversation || activeConversation.type !== 'direct') return
     await apiFetch(`/api/messages/chat/${activeConversation.id}`, { method: 'DELETE' })
@@ -867,25 +1118,28 @@ function App() {
 
   const requestLogout = () => setConfirmAction({ type: 'logout' })
   const requestDeleteMessage = (messageId) => setConfirmAction({ type: 'delete_message', messageId })
+  const requestDeleteMessages = (messageIds) => setConfirmAction({ type: 'delete_messages', messageIds })
   const requestClearChat = () => setConfirmAction({ type: 'clear_chat' })
   const requestDeleteChat = () => setConfirmAction({ type: 'delete_chat' })
 
   const runConfirmAction = async () => {
     if (!confirmAction) return
     if (confirmAction.type === 'delete_message') await deleteMessage(confirmAction.messageId)
+    else if (confirmAction.type === 'delete_messages') await deleteMessages(confirmAction.messageIds)
     else if (confirmAction.type === 'clear_chat') await clearChat()
     else if (confirmAction.type === 'delete_chat') await deleteChat()
     else if (confirmAction.type === 'logout') clearAuthSession('')
     setConfirmAction(null)
   }
 
-  const startDirectCall = (callType = 'video') => {
+  const startDirectCall = async (callType = 'video') => {
     if (activeConversationType !== 'direct' || !activeChat || !currentUser) return
     const a = Number(currentUser.id)
     const b = Number(activeChat.id)
     const roomId = `call_${Math.min(a, b)}_${Math.max(a, b)}_${Date.now()}`
     socketRef.current?.emit('call:invite', { toUserId: activeChat.id, roomId, callType }, (ack) => {
       if (!ack?.ok) {
+        setOutgoingCall((prev) => (prev?.roomId === roomId ? null : prev))
         setError(ack?.message || 'Failed to start call')
       }
     })
@@ -897,8 +1151,30 @@ function App() {
     })
   }
 
-  const acceptIncomingCall = () => {
+  const startCallToUser = (chatUser, callType = 'video') => {
+    if (!chatUser || !currentUser) return
+    const targetId = Number(chatUser.id)
+    if (!Number.isInteger(targetId)) return
+    const a = Number(currentUser.id)
+    const b = targetId
+    const roomId = `call_${Math.min(a, b)}_${Math.max(a, b)}_${Date.now()}`
+    socketRef.current?.emit('call:invite', { toUserId: targetId, roomId, callType }, (ack) => {
+      if (!ack?.ok) {
+        setOutgoingCall((prev) => (prev?.roomId === roomId ? null : prev))
+        setError(ack?.message || 'Failed to start call')
+      }
+    })
+    setOutgoingCall({
+      roomId,
+      callType,
+      status: 'calling',
+      peerUser: { id: targetId, username: chatUser.username, profileMediaUrl: chatUser.profileMediaUrl || null },
+    })
+  }
+
+  const acceptIncomingCall = async () => {
     if (!incomingCall) return
+    const callType = incomingCall.callType || 'video'
     socketRef.current?.emit('call:response', {
       toUserId: incomingCall.fromUser?.id,
       roomId: incomingCall.roomId,
@@ -906,9 +1182,10 @@ function App() {
     })
     setActiveCall({
       roomId: incomingCall.roomId,
-      callType: incomingCall.callType || 'video',
+      callType,
       status: 'connected',
       peerUser: incomingCall.fromUser || null,
+      startedAt: Date.now(),
     })
     setOutgoingCall(null)
     setIncomingCall(null)
@@ -926,13 +1203,28 @@ function App() {
 
   const cancelOutgoingCall = () => {
     if (outgoingCall?.peerUser?.id) {
-      socketRef.current?.emit('call:response', {
+      socketRef.current?.emit('call:cancel', {
         toUserId: outgoingCall.peerUser.id,
         roomId: outgoingCall.roomId,
-        accepted: false,
+        reason: 'canceled',
       })
     }
     setOutgoingCall(null)
+  }
+
+  const endActiveCall = () => {
+    setActiveCall((prev) => {
+      if (prev?.roomId && prev?.peerUser?.id) {
+        const startedAt = Number(prev.startedAt) || Date.now()
+        const durationSec = Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
+        socketRef.current?.emit('call:end', {
+          roomId: prev.roomId,
+          toUserId: prev.peerUser.id,
+          durationSec,
+        })
+      }
+      return null
+    })
   }
 
   if (!token) {
@@ -956,15 +1248,56 @@ function App() {
 
   if (loadingApp) {
     return (
-      <main className="grid min-h-screen place-items-center bg-[#e8dfd6]">
-        <p className="rounded-lg bg-white px-4 py-3 text-sm text-[#1f2c34] shadow">Loading chats...</p>
+      <main className="h-[100dvh] overflow-hidden bg-[#e8dfd6] p-0">
+        <section className="relative flex h-full w-full overflow-hidden bg-white">
+          <aside className="w-full bg-[#f8f8f8] md:max-w-sm md:border-r md:border-[#e4e4e4]">
+            <div className="border-b border-[#dce4e8] bg-[#f0f2f5] px-4 pb-4 pt-3">
+              <div className="flex items-center gap-3">
+                <div className="h-10 w-10 animate-pulse rounded-full bg-[#d7dde1]" />
+                <div className="flex-1 space-y-2">
+                  <div className="h-3 w-28 animate-pulse rounded bg-[#d7dde1]" />
+                  <div className="h-2.5 w-16 animate-pulse rounded bg-[#dfe4e8]" />
+                </div>
+              </div>
+              <div className="mt-4 h-11 animate-pulse rounded-full bg-[#e2e7eb]" />
+            </div>
+            <div className="space-y-1 px-4 py-3">
+              {[...Array(7)].map((_, i) => (
+                <div key={`sk-user-${i}`} className="flex items-center gap-3 rounded-lg px-1 py-2">
+                  <div className="h-11 w-11 animate-pulse rounded-full bg-[#d9dfe3]" />
+                  <div className="min-w-0 flex-1 space-y-2">
+                    <div className="h-3 w-32 animate-pulse rounded bg-[#d7dde1]" />
+                    <div className="h-2.5 w-24 animate-pulse rounded bg-[#e2e7eb]" />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </aside>
+
+          <div className="hidden flex-1 flex-col bg-[#efeae2] md:flex">
+            <div className="border-b border-[#e4e4e4] bg-[#f0f2f5] px-5 py-4">
+              <div className="h-4 w-44 animate-pulse rounded bg-[#d7dde1]" />
+            </div>
+            <div className="flex-1 space-y-3 px-8 py-6">
+              {[...Array(8)].map((_, i) => (
+                <div
+                  key={`sk-msg-${i}`}
+                  className={`h-12 animate-pulse rounded-2xl ${i % 2 === 0 ? 'w-56 bg-white/85' : 'ml-auto w-64 bg-[#d9fdd3]/80'}`}
+                />
+              ))}
+            </div>
+            <div className="border-t border-[#e4e4e4] bg-[#f0f2f5] px-4 py-3">
+              <div className="h-10 animate-pulse rounded-full bg-white" />
+            </div>
+          </div>
+        </section>
       </main>
     )
   }
 
   return (
-    <main className="min-h-screen bg-[#e8dfd6] p-0">
-      <section className="relative flex h-screen w-full overflow-hidden bg-white">
+    <main className="h-[100dvh] overflow-hidden bg-[#e8dfd6] p-0">
+      <section className="relative flex h-full w-full overflow-hidden bg-white">
         <ChatSidebar
           isMobileChatOpen={isMobileChatOpen}
           currentUser={currentUser}
@@ -986,6 +1319,8 @@ function App() {
           getLastMessageForUser={getLastMessageForUser}
           formatTime={formatTime}
           formatLastSeen={formatLastSeen}
+          onQuickAudioCall={(chatUser) => startCallToUser(chatUser, 'audio')}
+          onQuickVideoCall={(chatUser) => startCallToUser(chatUser, 'video')}
           onReachListEnd={loadMoreSidebarData}
           loadingMoreSidebar={loadingMoreSidebar}
         />
@@ -1010,6 +1345,7 @@ function App() {
           formatTime={formatTime}
           formatLastSeen={formatLastSeen}
           requestDeleteMessage={requestDeleteMessage}
+          requestDeleteMessages={requestDeleteMessages}
           draftMessage={draftMessage}
           setDraftMessage={setDraftMessage}
           sendMessage={sendMessage}
@@ -1051,6 +1387,39 @@ function App() {
 
         <ConfirmDialog confirmAction={confirmAction} setConfirmAction={setConfirmAction} runConfirmAction={runConfirmAction} />
 
+        {permissionHelp ? (
+          <div className="absolute inset-0 z-[70] grid place-items-center bg-black/45 p-4">
+            <div className="w-full max-w-sm rounded-2xl bg-white p-4 shadow-2xl">
+              <p className="text-base font-semibold text-[#1f2c34]">{permissionHelp.title}</p>
+              <p className="mt-2 text-sm text-[#54656f]">{permissionHelp.message}</p>
+              <div className="mt-3 rounded-lg bg-[#f4f7f9] p-3 text-xs text-[#445762]">
+                <p className="font-semibold text-[#1f2c34]">Quick fix</p>
+                <p className="mt-1">1. Browser address bar lock/info icon tap করুন</p>
+                <p>2. Camera ও Microphone = Allow করুন</p>
+                <p>3. Page reload করে আবার call দিন</p>
+                <p className="mt-1 text-[#667781]">Android: Settings {`>`} Apps {`>`} Chrome {`>`} Permissions</p>
+              </div>
+              <div className="mt-4 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={closePermissionHelp}
+                  className="rounded-md border border-[#d8dde1] px-3 py-2 text-sm text-[#1f2c34]"
+                >
+                  Close
+                </button>
+                <button
+                  type="button"
+                  onClick={retryPermissionCheck}
+                  className="inline-flex items-center gap-1 rounded-md bg-[#25d366] px-3 py-2 text-sm font-semibold text-white"
+                >
+                  {permissionHelp.callType === 'audio' ? <Mic size={14} /> : <Camera size={14} />}
+                  Try Again
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
+
         {outgoingCall ? (
           <div className="absolute inset-0 z-50 overflow-hidden bg-[#0b141a]">
             <div className="absolute inset-0 bg-gradient-to-b from-[#1f2c34] via-[#0f1a20] to-[#0b141a]" />
@@ -1090,10 +1459,10 @@ function App() {
                 onClick={cancelOutgoingCall}
                 className="group flex flex-col items-center gap-3 text-white"
               >
-                <span className="flex h-16 w-16 items-center justify-center rounded-full bg-[#f15c6d] shadow-lg transition group-hover:scale-105">
+                <span className="flex h-16 w-16 items-center justify-center rounded-full bg-[#f15c6d] shadow-[0_10px_24px_rgba(241,92,109,0.45)] transition group-hover:scale-105">
                   <PhoneOff size={28} />
                 </span>
-                <span className="text-sm text-[#d1d7db]">End</span>
+                <span className="rounded-full bg-black/25 px-3 py-1 text-sm text-[#d1d7db]">Cancel</span>
               </button>
             </div>
           </div>
@@ -1121,11 +1490,11 @@ function App() {
                 <p className="mt-1 text-sm text-[#d1d7db]">Tap to answer</p>
               </div>
 
-              <div className="mb-2 flex w-full max-w-xs items-center justify-between">
+              <div className="mb-20 flex w-full items-center justify-center gap-12 sm:mb-4 sm:gap-16">
                 <button
                   type="button"
                   onClick={rejectIncomingCall}
-                  className="group flex flex-col items-center gap-3 text-white"
+                  className="group flex w-24 flex-col items-center gap-3 text-white"
                 >
                   <span className="flex h-16 w-16 items-center justify-center rounded-full bg-[#f15c6d] shadow-lg transition group-hover:scale-105">
                     <PhoneOff size={28} />
@@ -1135,7 +1504,7 @@ function App() {
                 <button
                   type="button"
                   onClick={acceptIncomingCall}
-                  className="group flex flex-col items-center gap-3 text-white"
+                  className="group flex w-24 flex-col items-center gap-3 text-white"
                 >
                   <span className="flex h-16 w-16 items-center justify-center rounded-full bg-[#25d366] shadow-lg transition group-hover:scale-105">
                     {String(incomingCall.callType || 'video') === 'audio' ? <Phone size={28} /> : <Video size={28} />}
@@ -1149,7 +1518,7 @@ function App() {
 
         <ZegoCallModal
           open={Boolean(activeCall && activeCall.status === 'connected')}
-          onClose={() => setActiveCall(null)}
+          onClose={endActiveCall}
           appId={ZEGO_APP_ID}
           serverSecret={ZEGO_SERVER_SECRET}
           roomId={activeCall?.roomId || ''}
@@ -1158,6 +1527,7 @@ function App() {
           callType={activeCall?.callType || 'video'}
           peerUser={activeCall?.peerUser || null}
           callStatus={activeCall?.status || 'connecting'}
+          callStartedAt={activeCall?.startedAt || null}
         />
       </section>
     </main>

@@ -72,3 +72,17 @@
 .chat-scrollbar::-webkit-scrollbar-track {
   background: transparent;
 }
+
+/* Keep Zego call UI fully visible on mobile browsers */
+.zego-call-mobile-fix,
+.zego-call-mobile-fix * {
+  box-sizing: border-box;
+}
+
+@media (max-width: 767px) {
+  .zego-call-mobile-fix {
+    height: 100dvh;
+    width: 100vw;
+    overflow: hidden;
+  }
+}

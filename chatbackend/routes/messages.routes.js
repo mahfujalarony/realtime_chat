@@ -7,8 +7,13 @@ const router = express.Router()
 
 function isSenderMediaUrlValid(mediaUrl, uniqueUsername, messageType) {
   try {
-    const parsed = new URL(mediaUrl)
-    const pathname = decodeURIComponent(parsed.pathname).toLowerCase()
+    const raw = String(mediaUrl || '').trim()
+    if (!raw) return false
+    const pathname = decodeURIComponent(
+      raw.startsWith('/')
+        ? raw
+        : new URL(raw).pathname,
+    ).toLowerCase()
     const userPath = `/chat/${String(uniqueUsername).toLowerCase()}/`
     if (!pathname.includes(userPath)) return false
 

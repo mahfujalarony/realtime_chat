@@ -252,6 +252,27 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ success: false, error: "File not found" }));
     }
 
+    /* DELETE entire user chat folder */
+    /* Route: DELETE /delete-folder/chat/:username */
+    const deleteFolderMatch = req.url.match(/^\/delete-folder\/chat\/([^/?]+)/);
+    if (req.method === "DELETE" && deleteFolderMatch) {
+      const username = decodeURIComponent(deleteFolderMatch[1]);
+      const folderPath = path.join(__dirname, "uploads", "chat", username);
+      const uploadsRoot = path.join(__dirname, "uploads");
+
+      if (!folderPath.startsWith(uploadsRoot)) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ success: false, error: "Invalid path" }));
+      }
+
+      if (fs.existsSync(folderPath)) {
+        fs.rmSync(folderPath, { recursive: true, force: true });
+      }
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ success: true, message: "Folder deleted" }));
+    }
+
     res.writeHead(404);
     return res.end("Route not found");
   } catch (err) {

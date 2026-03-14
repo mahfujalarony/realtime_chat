@@ -1,5 +1,6 @@
-import { ArrowLeft, Download, FileText, Loader2, Maximize2, Mic, Paperclip, Pause, Phone, Play, Square, Trash2, UsersRound, Video, X } from 'lucide-react'
+import { ArrowDownLeft, ArrowUpRight, ArrowLeft, Check, Clock3, Download, FileText, Loader2, Maximize2, Mic, MoreVertical, Paperclip, Pause, Phone, PhoneOff, Play, Square, Trash2, UsersRound, Video, X } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
+import { Button } from '../ui/button'
 
 const AUDIO_MIME_CANDIDATES = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus']
 
@@ -14,6 +15,20 @@ function formatDuration(totalSeconds) {
 function pickSupportedAudioMimeType() {
   if (typeof MediaRecorder === 'undefined' || typeof MediaRecorder.isTypeSupported !== 'function') return ''
   return AUDIO_MIME_CANDIDATES.find((type) => MediaRecorder.isTypeSupported(type)) || ''
+}
+
+function parseCallLogText(text) {
+  const raw = String(text || '').trim()
+  if (!raw) return null
+  const missed = raw.match(/^Missed\s+(audio|video)\s+call$/i)
+  if (missed) {
+    return { kind: missed[1].toLowerCase(), missed: true, durationText: '' }
+  }
+  const completed = raw.match(/^(Audio|Video)\s+call\s+(?:•|-)\s+(.+)$/i)
+  if (completed) {
+    return { kind: completed[1].toLowerCase(), missed: false, durationText: completed[2] }
+  }
+  return null
 }
 
 function ViewportMedia({ className = '', placeholderClassName = '', rootMargin = '220px', children }) {
@@ -174,6 +189,7 @@ function ChatPanel({
   formatTime,
   formatLastSeen,
   requestDeleteMessage,
+  requestDeleteMessages,
   draftMessage,
   setDraftMessage,
   sendMessage,
@@ -190,6 +206,7 @@ function ChatPanel({
   markConversationSeen,
 }) {
   const mediaInputRef = useRef(null)
+  const draftInputRef = useRef(null)
   const recorderRef = useRef(null)
   const recordingStreamRef = useRef(null)
   const recordingTimerRef = useRef(null)
@@ -199,9 +216,13 @@ function ChatPanel({
   const [recordingSeconds, setRecordingSeconds] = useState(0)
   const [recordingError, setRecordingError] = useState('')
   const [previewMedia, setPreviewMedia] = useState(null)
+  const [selectedMessageIds, setSelectedMessageIds] = useState([])
   const seenCheckRafRef = useRef(null)
   const lastScrollTopRef = useRef(0)
   const ignoreOlderLoadUntilRef = useRef(0)
+  const longPressTimerRef = useRef(null)
+  const profileMenuRef = useRef(null)
+  const [keyboardInset, setKeyboardInset] = useState(0)
 
   const cleanupStream = () => {
     if (recordingTimerRef.current) {
@@ -228,8 +249,71 @@ function ChatPanel({
       const recorder = recorderRef.current
       if (recorder && recorder.state !== 'inactive') recorder.stop()
       cleanupStream()
+      if (longPressTimerRef.current) {
+        clearTimeout(longPressTimerRef.current)
+        longPressTimerRef.current = null
+      }
     }
   }, [])
+
+  useEffect(() => {
+    setSelectedMessageIds([])
+  }, [activeChat?.id, activeConversationType])
+
+  useEffect(() => {
+    if (!profileMenuOpen) return undefined
+    const handleOutside = (event) => {
+      const host = profileMenuRef.current
+      if (!host) return
+      if (!host.contains(event.target)) {
+        setProfileMenuOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handleOutside)
+    document.addEventListener('touchstart', handleOutside, { passive: true })
+    return () => {
+      document.removeEventListener('mousedown', handleOutside)
+      document.removeEventListener('touchstart', handleOutside)
+    }
+  }, [profileMenuOpen, setProfileMenuOpen])
+
+  const clearLongPressTimer = () => {
+    if (!longPressTimerRef.current) return
+    clearTimeout(longPressTimerRef.current)
+    longPressTimerRef.current = null
+  }
+
+  const startLongPressDelete = (message) => {
+    clearLongPressTimer()
+    longPressTimerRef.current = setTimeout(() => {
+      const messageId = Number(message?.id)
+      if (!Number.isInteger(messageId)) return
+      setSelectedMessageIds((prev) => (prev.includes(messageId) ? prev : [...prev, messageId]))
+      if (navigator.vibrate) navigator.vibrate(20)
+      longPressTimerRef.current = null
+    }, 480)
+  }
+
+  const toggleSelectMessage = (message) => {
+    const messageId = Number(message?.id)
+    if (!Number.isInteger(messageId)) return
+    setSelectedMessageIds((prev) => (prev.includes(messageId) ? prev.filter((id) => id !== messageId) : [...prev, messageId]))
+  }
+
+  const clearSelectionMode = () => setSelectedMessageIds([])
+
+  const deleteSelectedMessages = () => {
+    if (!selectedMessageIds.length) return
+    requestDeleteMessages?.(selectedMessageIds)
+    setSelectedMessageIds([])
+  }
+
+  const selectAllOwnMessages = () => {
+    const mineIds = (activeMessages || [])
+      .filter((message) => Number(message.senderId) === Number(currentUser?.id) && Number.isInteger(Number(message.id)))
+      .map((message) => Number(message.id))
+    setSelectedMessageIds(Array.from(new Set(mineIds)))
+  }
 
   const maybeMarkSeenWhenLastVisible = () => {
     if (activeConversationType !== 'direct') return
@@ -303,6 +387,45 @@ function ChatPanel({
     listEl.addEventListener('scroll', onScroll, { passive: true })
     return () => listEl.removeEventListener('scroll', onScroll)
   }, [activeChat?.id, activeMessages, messageListRef, activeConversationType, hasOlderMessages, loadingOlderMessages, loadOlderMessages])
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.visualViewport) return undefined
+    const viewport = window.visualViewport
+
+    const updateInset = () => {
+      const rawInset = window.innerHeight - viewport.height - viewport.offsetTop
+      const nextInset = rawInset > 0 ? Math.round(rawInset) : 0
+      setKeyboardInset(nextInset)
+    }
+
+    viewport.addEventListener('resize', updateInset)
+    viewport.addEventListener('scroll', updateInset)
+    updateInset()
+    return () => {
+      viewport.removeEventListener('resize', updateInset)
+      viewport.removeEventListener('scroll', updateInset)
+    }
+  }, [])
+
+  const ensureInputVisible = () => {
+    const node = draftInputRef.current
+    if (!node) return
+    requestAnimationFrame(() => {
+      node.scrollIntoView({ block: 'nearest', behavior: 'auto' })
+    })
+  }
+
+  const autoResizeDraft = () => {
+    const node = draftInputRef.current
+    if (!node) return
+    node.style.height = 'auto'
+    const nextHeight = Math.min(node.scrollHeight, 112)
+    node.style.height = `${Math.max(38, nextHeight)}px`
+  }
+
+  useEffect(() => {
+    autoResizeDraft()
+  }, [draftMessage, isRecording])
 
   const startRecording = async () => {
     if (isRecording || uploadingMedia) return
@@ -413,9 +536,24 @@ function ChatPanel({
   }
 
   return (
-    <section className={`w-full min-h-0 flex-col ${isMobileChatOpen ? 'flex' : 'hidden md:flex md:flex-col'}`}>
+    <section className={`h-full w-full min-h-0 flex-col ${isMobileChatOpen ? 'flex' : 'hidden md:flex md:flex-col'}`}>
       <header className="flex items-center gap-3 border-b border-[#e4e4e4] bg-[#f0f2f5] px-4 py-3">
-        {activeChat ? (
+        {selectedMessageIds.length > 0 ? (
+          <>
+            <button type="button" onClick={clearSelectionMode} className="rounded-full p-1 text-[#54656f] transition hover:bg-[#e6eaed]" aria-label="Cancel selection">
+              <ArrowLeft size={20} />
+            </button>
+            <p className="text-sm font-semibold text-[#1f2c34]">{selectedMessageIds.length} selected</p>
+            <div className="ml-auto flex items-center gap-2">
+              <Button type="button" variant="outline" size="sm" onClick={selectAllOwnMessages} className="h-8 px-3 text-xs">
+                Select all
+              </Button>
+              <Button type="button" variant="destructive" size="sm" onClick={deleteSelectedMessages} className="h-8 px-3 text-xs">
+                Delete
+              </Button>
+            </div>
+          </>
+        ) : activeChat ? (
           <>
             <button
               type="button"
@@ -448,9 +586,9 @@ function ChatPanel({
                   : activeChat.isOnline ? 'online' : formatLastSeen(activeChat.lastSeen)}
               </p>
             </button>
-            <div className="relative ml-auto">
+            <div ref={profileMenuRef} className="relative ml-auto flex items-center">
               {activeConversationType === 'direct' ? (
-                <div className="mr-2 inline-flex items-center gap-1">
+                <div className="mr-1 inline-flex items-center gap-1">
                   <button
                     type="button"
                     onClick={startAudioCall}
@@ -471,13 +609,16 @@ function ChatPanel({
                   </button>
                 </div>
               ) : null}
-              <button
+              <Button
                 type="button"
+                variant="ghost"
+                size="icon-sm"
                 onClick={() => setProfileMenuOpen((prev) => !prev)}
-                className="rounded-md px-2 py-1 text-xl leading-none text-[#54656f] hover:bg-[#e7ecef]"
+                className="h-8 w-8 rounded-full text-[#54656f] hover:bg-[#e7ecef]"
+                aria-label="More options"
               >
-                ...
-              </button>
+                <MoreVertical size={18} />
+              </Button>
               {profileMenuOpen && activeConversationType === 'direct' ? (
                 <div className="absolute right-0 top-10 z-10 w-44 rounded-lg border border-[#e4e4e4] bg-white p-1 shadow-lg">
                   <button
@@ -518,6 +659,7 @@ function ChatPanel({
 
           <div className="flex flex-col gap-1 py-2">
             {activeMessages.map((message, index) => {
+              const callLog = message.messageType === 'text' ? parseCallLogText(message.text) : null
               const isMine = currentUser && Number(message.senderId) === Number(currentUser.id)
               const isTempMessage = typeof message.id === 'string'
               const prevMessage = activeMessages[index - 1]
@@ -545,6 +687,55 @@ function ChatPanel({
                   ? 'delivered'
                   : formatTime(message.createdAt))
               const isDeliveredLabel = metaText === 'delivered'
+              const messageIdNum = Number(message?.id)
+              const isSelected = Number.isInteger(messageIdNum) && selectedMessageIds.includes(messageIdNum)
+              if (callLog) {
+                const isOutgoingCallLog = currentUser && Number(message.senderId) === Number(currentUser.id)
+                const callToneClass = callLog.missed
+                  ? 'border-[#ffd9de] bg-[#fff1f3] text-[#cf294f]'
+                  : 'border-[#cdeedd] bg-[#ebfff3] text-[#0c8f4f]'
+                const callTypeLabel = callLog.kind === 'video' ? 'video' : 'audio'
+                const titleText = callLog.missed
+                  ? `Missed ${callTypeLabel} call`
+                  : `${isOutgoingCallLog ? 'Outgoing' : 'Incoming'} ${callTypeLabel} call`
+                const actorText = isOutgoingCallLog
+                  ? 'You called'
+                  : `${activeChat?.username || 'User'} called you`
+                return (
+                  <div
+                    key={message.id}
+                    data-message-id={message.id}
+                    className={`mt-2 flex ${isOutgoingCallLog ? 'justify-end pr-1' : 'justify-start pl-1'}`}
+                  >
+                    <div className={`inline-flex items-center gap-2 rounded-xl border px-3 py-2 text-xs shadow-sm ${callToneClass}`}>
+                      <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-white/80">
+                        {callLog.missed ? (
+                          <PhoneOff size={13} />
+                        ) : isOutgoingCallLog ? (
+                          <ArrowUpRight size={13} />
+                        ) : (
+                          <ArrowDownLeft size={13} />
+                        )}
+                      </span>
+                      <div className="flex flex-col leading-tight">
+                        <span className="font-semibold">{actorText}</span>
+                        <span className="text-[11px]">{titleText}</span>
+                        <span className="text-[11px] text-[#667781]">
+                          {callLog.durationText ? (
+                            <span className="inline-flex items-center gap-1">
+                              <Clock3 size={11} />
+                              {callLog.durationText}
+                            </span>
+                          ) : (
+                            callLog.kind === 'video' ? 'Video call' : 'Audio call'
+                          )}
+                        </span>
+                      </div>
+                      <span className="ml-1 text-[11px] text-[#667781]">{formatTime(message.createdAt)}</span>
+                    </div>
+                  </div>
+                )
+              }
 
               return (
                 <div
@@ -553,15 +744,43 @@ function ChatPanel({
                   className={`group flex items-end gap-1 ${isMine ? 'flex-row-reverse' : 'flex-row'} ${showTail ? 'mt-2' : 'mt-0.5'}`}
                 >
                   <div
-                    className={`message-bubble ${isMine ? 'sent' : 'received'} ${!showTail ? (isMine ? '!rounded-tr-lg' : '!rounded-tl-lg') : ''}`}
+                    className={`relative message-bubble ${isMine ? 'sent' : 'received'} ${!showTail ? (isMine ? '!rounded-tr-lg' : '!rounded-tl-lg') : ''} ${
+                      isSelected
+                        ? isMine
+                          ? 'ring-2 ring-[#25d366] bg-[#d7f9e6] shadow-[0_0_0_1px_rgba(37,211,102,0.25)]'
+                          : 'ring-2 ring-[#25d366] bg-[#eef9f3] shadow-[0_0_0_1px_rgba(37,211,102,0.25)]'
+                        : ''
+                    }`}
                     style={{ maxWidth: '65%' }}
+                    onClick={() => {
+                      if (selectedMessageIds.length > 0 && activeConversationType === 'direct' && isMine && !isTempMessage) {
+                        toggleSelectMessage(message)
+                      }
+                    }}
+                    onTouchStart={() => {
+                      if (activeConversationType === 'direct' && isMine && !isTempMessage) startLongPressDelete(message)
+                    }}
+                    onTouchEnd={clearLongPressTimer}
+                    onTouchCancel={clearLongPressTimer}
+                    onTouchMove={clearLongPressTimer}
+                    onContextMenu={(event) => {
+                      if (activeConversationType === 'direct' && isMine && !isTempMessage) {
+                        event.preventDefault()
+                        requestDeleteMessage(message.id)
+                      }
+                    }}
                   >
+                    {isSelected ? (
+                      <span className="absolute -left-2 -top-2 z-10 inline-flex h-5 w-5 items-center justify-center rounded-full bg-[#25d366] text-white shadow">
+                        <Check size={12} />
+                      </span>
+                    ) : null}
                     {!isMine && activeConversationType === 'group' && showTail ? (
                       <p className="mb-1 text-[11px] font-medium text-[#008069]">{groupMemberNames[message.senderId] || 'Member'}</p>
                     ) : null}
 
                     {showAsAlbum ? (
-                      <div className="mb-1 grid max-w-[360px] grid-cols-3 gap-1 rounded-md">
+                      <div className="mb-1 grid max-w-full grid-cols-3 gap-1 rounded-md">
                         {albumItems.map((item) =>
                           item.messageType === 'image' ? (
                             <div key={item.id} className="group/album relative h-24 w-full overflow-hidden rounded">
@@ -592,14 +811,14 @@ function ChatPanel({
                               </a>
                             </div>
                           ) : (
-                            <div key={item.id} className="group/album relative col-span-2 h-28 w-full overflow-hidden rounded">
-                              <ViewportMedia className="h-28 w-full" placeholderClassName="h-28 w-full animate-pulse bg-[#dfe7eb]">
+                            <div key={item.id} className="group/album relative col-span-3 max-h-72 w-full overflow-hidden rounded-md">
+                              <ViewportMedia className="max-h-72 w-full rounded-md" placeholderClassName="h-56 w-full animate-pulse rounded-md bg-[#dfe7eb]">
                                 {(shouldLoad) => (
                                   <video
                                     src={shouldLoad ? item.mediaUrl : undefined}
                                     controls
                                     preload="none"
-                                    className="h-28 w-full object-cover"
+                                    className="max-h-72 w-full rounded-md"
                                   />
                                 )}
                               </ViewportMedia>
@@ -744,7 +963,10 @@ function ChatPanel({
         </div>
       </div>
 
-      <footer className="border-t border-[#e4e4e4] bg-[#f0f2f5] p-3">
+      <footer
+        className="border-t border-[#e4e4e4] bg-[#f0f2f5] p-2 md:p-3"
+        style={{ paddingBottom: `calc(max(0.5rem, env(safe-area-inset-bottom)) + ${keyboardInset}px)` }}
+      >
         <div className="mx-auto max-w-3xl">
           {recordingError ? (
             <div className="mb-2 rounded-md bg-[#fff1f1] px-3 py-2 text-xs text-[#cc1744]">{recordingError}</div>
@@ -832,16 +1054,30 @@ function ChatPanel({
                 Recording {formatDuration(recordingSeconds)}
               </div>
             ) : null}
-            <input
-              type="text"
-              placeholder={activeChat ? (isRecording ? 'Recording in progress...' : 'Type a message') : 'Select a chat first'}
+            <textarea
+              ref={draftInputRef}
+              placeholder={activeChat ? (isRecording ? 'Recording in progress...' : 'Type a message...') : 'Select a chat first'}
               value={draftMessage}
-              onChange={(event) => setDraftMessage(event.target.value)}
+              onChange={(event) => {
+                setDraftMessage(event.target.value)
+                autoResizeDraft()
+              }}
+              onFocus={ensureInputVisible}
               onKeyDown={(event) => {
-                if (event.key === 'Enter' && !isRecording) sendMessage()
+                const isDesktop = typeof window !== 'undefined' && window.matchMedia('(min-width: 768px)').matches
+                if (event.key === 'Enter' && !event.shiftKey && !isRecording && isDesktop) {
+                  event.preventDefault()
+                  sendMessage()
+                  return
+                }
+                if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !isRecording && !isDesktop) {
+                  event.preventDefault()
+                  sendMessage()
+                }
               }}
               disabled={!activeChat || isRecording}
-              className="flex-1 rounded-lg border border-[#dde2e5] bg-white px-3 py-2 text-sm outline-none placeholder:text-[#7a8b95] focus:border-[#25d366] disabled:cursor-not-allowed disabled:bg-[#f7f7f7]"
+              rows={1}
+              className="max-h-28 min-h-[38px] flex-1 resize-none rounded-lg border border-[#e3e7ea] bg-white px-3 py-2 text-sm leading-5 outline-none placeholder:text-[#7a8b95] focus:border-[#25d366] disabled:cursor-not-allowed disabled:bg-[#f7f7f7]"
             />
             <button
               type="button"
