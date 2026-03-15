@@ -188,6 +188,7 @@ function ChatPanel({
   currentUser,
   formatTime,
   formatLastSeen,
+  activeConversationNote,
   requestDeleteMessage,
   requestDeleteMessages,
   draftMessage,
@@ -646,6 +647,11 @@ function ChatPanel({
 
       <div ref={messageListRef} className="chat-wallpaper chat-scrollbar flex-1 overflow-y-auto px-4 py-2 md:px-12">
         <div className="messages-container mx-auto max-w-3xl">
+          {activeConversationNote ? (
+            <div className="mx-auto my-2 rounded-lg border border-[#ffe7a8] bg-[#fff7d8] px-3 py-2 text-xs text-[#7d5b00] shadow-sm">
+              <span className="font-semibold">Admin note:</span> {activeConversationNote}
+            </div>
+          ) : null}
           {loadingOlderMessages ? (
             <div className="mx-auto my-2 w-fit rounded-full bg-white/90 px-3 py-1 text-[11px] text-[#667781] shadow">
               Loading older messages...

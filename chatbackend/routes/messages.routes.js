@@ -1,7 +1,8 @@
 const express = require('express')
 const { Op } = require('sequelize')
 const authMiddleware = require('../middleware/auth')
-const { Message, User, Contact } = require('../models')
+const { Message, User } = require('../models')
+const { canAccessPairConversation, isExternalUser, canHandleExternal } = require('../utils/chat-access')
 
 const router = express.Router()
 
@@ -52,10 +53,35 @@ function formatMessage(message) {
   }
 }
 
-async function ensureContact(currentUserId, otherUserId) {
-  return Contact.findOne({
-    where: { userId: currentUserId, contactUserId: otherUserId },
-  })
+function buildConversationWhere(requestUser, otherUser, assignment) {
+  const requestIsExternal = isExternalUser(requestUser)
+  const otherIsExternal = isExternalUser(otherUser)
+  const externalId = requestIsExternal ? requestUser.id : otherIsExternal ? otherUser.id : null
+  if (!externalId || !assignment) {
+    return {
+      [Op.or]: [
+        { senderId: requestUser.id, receiverId: otherUser.id },
+        { senderId: otherUser.id, receiverId: requestUser.id },
+      ],
+    }
+  }
+  return {
+    [Op.or]: [
+      { senderId: externalId, receiverId: { [Op.in]: [assignment.assignedToUserId, assignment.publicHandlerUserId].filter(Boolean) } },
+      { receiverId: externalId, senderId: { [Op.in]: [assignment.assignedToUserId, assignment.publicHandlerUserId].filter(Boolean) } },
+    ],
+  }
+}
+
+function mapPayloadForExternalViewer(messagePayload, assignment) {
+  if (!assignment) return messagePayload
+  const externalUserId = Number(assignment.externalUserId)
+  const publicHandlerUserId = Number(assignment.publicHandlerUserId || assignment.assignedToUserId)
+  if (!Number.isInteger(externalUserId) || !Number.isInteger(publicHandlerUserId)) return messagePayload
+  const next = { ...messagePayload }
+  if (Number(next.senderId) !== externalUserId) next.senderId = publicHandlerUserId
+  if (Number(next.receiverId) !== externalUserId) next.receiverId = publicHandlerUserId
+  return next
 }
 
 router.get('/:userId', authMiddleware, async (req, res) => {
@@ -74,17 +100,10 @@ router.get('/:userId', authMiddleware, async (req, res) => {
     if (!otherUser) {
       return res.status(404).json({ message: 'User not found' })
     }
-    const contact = await ensureContact(req.user.id, otherUserId)
-    if (!contact) {
-      return res.status(403).json({ message: 'Add this user to contacts first' })
-    }
+    const access = await canAccessPairConversation(req.user, otherUser)
+    if (!access.ok) return res.status(403).json({ message: access.reason })
 
-    const conversationWhere = {
-      [Op.or]: [
-        { senderId: req.user.id, receiverId: otherUserId },
-        { senderId: otherUserId, receiverId: req.user.id },
-      ],
-    }
+    const conversationWhere = buildConversationWhere(req.user, otherUser, access.assignment)
     if (beforeId) {
       conversationWhere.id = { [Op.lt]: beforeId }
     }
@@ -101,17 +120,20 @@ router.get('/:userId', authMiddleware, async (req, res) => {
       oldestLoadedId &&
         (await Message.findOne({
           where: {
-            [Op.or]: [
-              { senderId: req.user.id, receiverId: otherUserId },
-              { senderId: otherUserId, receiverId: req.user.id },
-            ],
+            ...buildConversationWhere(req.user, otherUser, access.assignment),
             id: { [Op.lt]: oldestLoadedId },
           },
           attributes: ['id'],
         })),
     )
 
-    return res.json({ messages: messages.map(formatMessage), hasMore, nextBeforeId: oldestLoadedId })
+    return res.json({
+      messages: messages.map(formatMessage),
+      hasMore,
+      nextBeforeId: oldestLoadedId,
+      conversationNote: access.assignment?.note || '',
+      conversationAssignedToUserId: access.assignment?.assignedToUserId || null,
+    })
   } catch (error) {
     return res.status(500).json({ message: 'Failed to fetch messages', error: error.message })
   }
@@ -124,14 +146,19 @@ router.post('/:userId/seen', authMiddleware, async (req, res) => {
       return res.status(400).json({ message: 'Invalid userId' })
     }
 
-    const contact = await ensureContact(req.user.id, otherUserId)
-    if (!contact) {
-      return res.status(403).json({ message: 'Add this user to contacts first' })
-    }
+    const otherUser = await User.findByPk(otherUserId)
+    if (!otherUser) return res.status(404).json({ message: 'User not found' })
+    const access = await canAccessPairConversation(req.user, otherUser)
+    if (!access.ok) return res.status(403).json({ message: access.reason })
+
+    const requestIsExternal = isExternalUser(req.user)
+    const senderIds = requestIsExternal
+      ? [access.assignment?.assignedToUserId, access.assignment?.publicHandlerUserId].filter(Boolean)
+      : [otherUserId]
 
     const unseenMessages = await Message.findAll({
       where: {
-        senderId: otherUserId,
+        senderId: senderIds.length > 1 ? { [Op.in]: senderIds } : senderIds[0],
         receiverId: req.user.id,
         seen: false,
       },
@@ -217,14 +244,17 @@ router.post('/:userId', authMiddleware, async (req, res) => {
     if (!otherUser) {
       return res.status(404).json({ message: 'User not found' })
     }
-    const contact = await ensureContact(req.user.id, otherUserId)
-    if (!contact) {
-      return res.status(403).json({ message: 'Add this user to contacts first' })
-    }
+    const access = await canAccessPairConversation(req.user, otherUser)
+    if (!access.ok) return res.status(403).json({ message: access.reason })
+
+    const requestIsExternal = isExternalUser(req.user)
+    const effectiveOtherUserId = requestIsExternal
+      ? Number(access.assignment?.assignedToUserId || otherUserId)
+      : otherUserId
 
     const message = await Message.create({
       senderId: req.user.id,
-      receiverId: otherUserId,
+      receiverId: effectiveOtherUserId,
       text: text || null,
       messageType: mediaUrl ? messageType : 'text',
       mediaUrl: mediaUrl || null,
@@ -235,11 +265,19 @@ router.post('/:userId', authMiddleware, async (req, res) => {
     })
 
     const payload = formatMessage(message)
+    const assignment = access.assignment
+    const externalUserId = Number(assignment?.externalUserId || 0)
+    const senderPayload = Number(req.user.id) === externalUserId
+      ? mapPayloadForExternalViewer(payload, assignment)
+      : payload
+    const receiverPayload = Number(effectiveOtherUserId) === externalUserId
+      ? mapPayloadForExternalViewer(payload, assignment)
+      : payload
     const io = req.app.get('io')
-    io.to(`user:${req.user.id}`).emit('chat:message', payload)
-    io.to(`user:${otherUserId}`).emit('chat:message', payload)
+    io.to(`user:${req.user.id}`).emit('chat:message', senderPayload)
+    io.to(`user:${effectiveOtherUserId}`).emit('chat:message', receiverPayload)
 
-    return res.status(201).json({ message: payload })
+    return res.status(201).json({ message: senderPayload })
   } catch (error) {
     return res.status(500).json({ message: 'Failed to send message', error: error.message })
   }
@@ -257,10 +295,8 @@ router.delete('/chat/:userId', authMiddleware, async (req, res) => {
       return res.status(404).json({ message: 'User not found' })
     }
 
-    const contact = await ensureContact(req.user.id, otherUserId)
-    if (!contact) {
-      return res.status(403).json({ message: 'Add this user to contacts first' })
-    }
+    const access = await canAccessPairConversation(req.user, otherUser)
+    if (!access.ok) return res.status(403).json({ message: access.reason })
 
     await Message.destroy({
       where: {

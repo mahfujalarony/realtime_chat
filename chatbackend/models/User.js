@@ -58,6 +58,16 @@ module.exports = (sequelize, DataTypes) => {
           isIn: [['user', 'model_admin', 'admin']],
         },
       },
+      canHandleExternalChat: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: false,
+      },
+      canDownloadConversations: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: false,
+      },
     },
     {
       tableName: 'users',

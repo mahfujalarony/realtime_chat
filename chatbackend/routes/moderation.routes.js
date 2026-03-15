@@ -1,16 +1,17 @@
 const express = require('express')
 const { Op } = require('sequelize')
 const authMiddleware = require('../middleware/auth')
-const { User, Message } = require('../models')
+const { User, Message, ConversationAssignment } = require('../models')
+const { isAdmin } = require('../utils/chat-access')
 
 const router = express.Router()
-const allowRoleBypassForTest = String(process.env.ROLE_BYPASS_FOR_TEST || '1') === '1'
+const allowRoleBypassForTest = String(process.env.ROLE_BYPASS_FOR_TEST || '0') === '1'
 
 function requireStaff(req, res, next) {
   if (allowRoleBypassForTest) return next()
-  const role = String(req.user?.role || 'user')
-  if (role !== 'admin' && role !== 'model_admin') {
-    return res.status(403).json({ message: 'Admin or model_admin access required' })
+  if (isAdmin(req.user)) return next()
+  if (!req.user?.canDownloadConversations) {
+    return res.status(403).json({ message: 'Download access is disabled by admin' })
   }
   return next()
 }
@@ -44,6 +45,19 @@ router.get('/conversations/export-csv', authMiddleware, requireStaff, async (req
     })
     if (users.length !== 2) {
       return res.status(404).json({ message: 'One or both users not found' })
+    }
+    if (!isAdmin(req.user)) {
+      const assignment = await ConversationAssignment.findOne({
+        where: {
+          [Op.or]: [
+            { externalUserId: userAId, assignedToUserId: req.user.id },
+            { externalUserId: userBId, assignedToUserId: req.user.id },
+          ],
+        },
+      })
+      if (!assignment) {
+        return res.status(403).json({ message: 'You can only download conversations assigned to you' })
+      }
     }
     const userById = users.reduce((acc, item) => {
       acc[Number(item.id)] = item

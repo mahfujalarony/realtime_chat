@@ -14,6 +14,8 @@ function serializeUser(user) {
     username: user.username,
     uniqueUsername: user.uniqueUsername,
     role: user.role || 'user',
+    canHandleExternalChat: Boolean(user.canHandleExternalChat),
+    canDownloadConversations: Boolean(user.canDownloadConversations),
     email: user.email,
     mobileNumber: user.mobileNumber,
     dateOfBirth: user.dateOfBirth,

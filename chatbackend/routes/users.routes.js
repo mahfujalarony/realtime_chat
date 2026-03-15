@@ -1,23 +1,40 @@
 const express = require('express')
 const { Op, QueryTypes } = require('sequelize')
 const authMiddleware = require('../middleware/auth')
-const { User, Contact, Message, sequelize } = require('../models')
+const { User, Contact, Message, ConversationAssignment, sequelize } = require('../models')
 const { UPLOAD_SERVER_URL } = require('../utils/upload-server')
+const {
+  isAdmin,
+  canHandleExternal,
+  isExternalUser,
+  isValidConversationPair,
+  getExternalAndInternal,
+  getOrCreateAssignmentForPair,
+} = require('../utils/chat-access')
 
 const router = express.Router()
 
 async function resolveUserByIdentifier(identifier) {
+  const numericId = Number(identifier)
+  if (Number.isInteger(numericId) && String(numericId) === String(identifier).trim()) {
+    const byId = await User.findOne({
+      where: { id: numericId },
+      attributes: ['id', 'username', 'uniqueUsername', 'role', 'canHandleExternalChat', 'email', 'mobileNumber', 'lastSeen', 'profileMediaUrl', 'createdAt'],
+    })
+    if (byId) return byId
+  }
+
   const directMatch = await User.findOne({
     where: {
       [Op.or]: [{ uniqueUsername: identifier }, { email: identifier }, { mobileNumber: identifier }],
     },
-    attributes: ['id', 'username', 'uniqueUsername', 'email', 'mobileNumber', 'lastSeen', 'profileMediaUrl', 'createdAt'],
+    attributes: ['id', 'username', 'uniqueUsername', 'role', 'canHandleExternalChat', 'email', 'mobileNumber', 'lastSeen', 'profileMediaUrl', 'createdAt'],
   })
   if (directMatch) return directMatch
 
   const sameNameUsers = await User.findAll({
     where: { username: identifier },
-    attributes: ['id', 'username', 'uniqueUsername', 'email', 'mobileNumber', 'lastSeen', 'profileMediaUrl', 'createdAt'],
+    attributes: ['id', 'username', 'uniqueUsername', 'role', 'canHandleExternalChat', 'email', 'mobileNumber', 'lastSeen', 'profileMediaUrl', 'createdAt'],
     limit: 2,
   })
   if (sameNameUsers.length === 1) return sameNameUsers[0]
@@ -74,6 +91,28 @@ function isProfileMediaUrlValidForUser(mediaUrl, uniqueUsername) {
   }
 }
 
+function serializeLookupUser(user) {
+  return {
+    id: user.id,
+    username: user.username,
+    uniqueUsername: user.uniqueUsername,
+    role: user.role || 'user',
+    canHandleExternalChat: Boolean(user.canHandleExternalChat),
+    email: user.email,
+    mobileNumber: user.mobileNumber,
+    lastSeen: user.lastSeen,
+    profileMediaUrl: user.profileMediaUrl,
+    createdAt: user.createdAt,
+  }
+}
+
+async function ensureOneWayContact(userId, contactUserId) {
+  await Contact.findOrCreate({
+    where: { userId, contactUserId },
+    defaults: { userId, contactUserId },
+  })
+}
+
 router.get('/', authMiddleware, async (req, res) => {
   try {
     const q = (req.query.q || '').trim()
@@ -113,6 +152,8 @@ router.get('/', authMiddleware, async (req, res) => {
         u.id AS id,
         u.username AS username,
         u.unique_username AS uniqueUsername,
+        u.role AS role,
+        u.can_handle_external_chat AS canHandleExternalChat,
         u.email AS email,
         u.mobile_number AS mobileNumber,
         u.last_seen AS lastSeen,
@@ -175,6 +216,7 @@ router.get('/', authMiddleware, async (req, res) => {
     const onlineUserSockets = req.app.get('onlineUserSockets') || new Map()
     const users = rows.map((row) => ({
       ...row,
+      canHandleExternalChat: Boolean(row.canHandleExternalChat),
       unreadCount: Number(row.unreadCount) || 0,
       isOnline: onlineUserSockets.has(Number(row.id)),
     }))
@@ -202,19 +244,51 @@ router.post('/contacts', authMiddleware, async (req, res) => {
       return res.status(400).json({ message: 'You cannot add yourself as contact' })
     }
 
-    const [, created] = await Contact.findOrCreate({
-      where: { userId: req.user.id, contactUserId: targetUser.id },
-      defaults: { userId: req.user.id, contactUserId: targetUser.id },
+    if (!isValidConversationPair(req.user, targetUser)) {
+      return res.status(403).json({ message: 'Only external user and internal team member chat is allowed' })
+    }
+
+    const { externalUser, internalUser } = getExternalAndInternal(req.user, targetUser)
+    if (!canHandleExternal(internalUser)) {
+      return res.status(403).json({ message: 'This user is not allowed to handle external conversations' })
+    }
+
+    let assignment = await ConversationAssignment.findOne({
+      where: { externalUserId: externalUser.id },
     })
 
-    await Contact.findOrCreate({
-      where: { userId: targetUser.id, contactUserId: req.user.id },
-      defaults: { userId: targetUser.id, contactUserId: req.user.id },
-    })
+    if (isExternalUser(req.user) && assignment) {
+      const publicHandlerId = Number(assignment.publicHandlerUserId || assignment.assignedToUserId)
+      if (publicHandlerId !== Number(targetUser.id)) {
+        return res.status(403).json({ message: 'Please use your assigned team member unique id' })
+      }
+    }
 
-    return res.status(created ? 201 : 200).json({
-      message: 'Contact added successfully',
-      contact: targetUser,
+    if (assignment && Number(assignment.assignedToUserId) !== Number(internalUser.id)) {
+      if (!isAdmin(req.user)) {
+        return res.status(403).json({ message: 'This conversation is assigned to another team member' })
+      }
+      assignment.assignedToUserId = internalUser.id
+      assignment.assignedByUserId = req.user.id
+      await assignment.save()
+    } else if (!assignment) {
+      assignment = await getOrCreateAssignmentForPair({
+        externalUser,
+        internalUser,
+        assignedByUserId: isAdmin(req.user) ? req.user.id : null,
+      })
+    }
+
+    await ensureOneWayContact(assignment.assignedToUserId, externalUser.id)
+    await ensureOneWayContact(externalUser.id, Number(assignment.publicHandlerUserId || assignment.assignedToUserId))
+
+    return res.status(201).json({
+      message: 'Conversation added successfully',
+      contact: serializeLookupUser(targetUser),
+      assignment: {
+        externalUserId: assignment.externalUserId,
+        assignedToUserId: assignment.assignedToUserId,
+      },
     })
   } catch (error) {
     if (error.statusCode) {
@@ -239,10 +313,29 @@ router.get('/lookup', authMiddleware, async (req, res) => {
 
     if (targetUser.id === req.user.id) {
       return res.json({
-        user: targetUser,
+        user: serializeLookupUser(targetUser),
         alreadyContact: false,
         isSelf: true,
       })
+    }
+
+    if (!isValidConversationPair(req.user, targetUser)) {
+      return res.status(403).json({ message: 'This user cannot be added to your chat list' })
+    }
+    const { internalUser, externalUser } = getExternalAndInternal(req.user, targetUser)
+    if (!canHandleExternal(internalUser)) {
+      return res.status(403).json({ message: 'This user is not allowed to handle external conversations' })
+    }
+    const assignment = await ConversationAssignment.findOne({
+      where: { externalUserId: externalUser.id },
+    })
+    const blockedByAssignment = assignment && !isAdmin(req.user) && (
+      isExternalUser(req.user)
+        ? Number(assignment.publicHandlerUserId || assignment.assignedToUserId) !== Number(targetUser.id)
+        : Number(assignment.assignedToUserId) !== Number(internalUser.id)
+    )
+    if (blockedByAssignment) {
+      return res.status(403).json({ message: 'Conversation already assigned to another team member' })
     }
 
     const contact = await Contact.findOne({
@@ -250,7 +343,7 @@ router.get('/lookup', authMiddleware, async (req, res) => {
     })
 
     return res.json({
-      user: targetUser,
+      user: serializeLookupUser(targetUser),
       alreadyContact: Boolean(contact),
       isSelf: false,
     })
@@ -309,6 +402,9 @@ router.post('/profile-media', authMiddleware, async (req, res) => {
         id: req.user.id,
         username: req.user.username,
         uniqueUsername: req.user.uniqueUsername,
+        role: req.user.role || 'user',
+        canHandleExternalChat: Boolean(req.user.canHandleExternalChat),
+        canDownloadConversations: Boolean(req.user.canDownloadConversations),
         email: req.user.email,
         mobileNumber: req.user.mobileNumber,
         lastSeen: req.user.lastSeen,

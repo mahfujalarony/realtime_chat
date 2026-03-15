@@ -109,6 +109,7 @@ function ChatSidebar({
   }
 
   const isActiveConversation = (type, id) => activeConversation?.type === type && Number(activeConversation?.id) === Number(id)
+  const isInternalUser = currentUser?.role === 'admin' || currentUser?.role === 'model_admin' || currentUser?.canHandleExternalChat
 
   return (
     <aside
@@ -326,12 +327,16 @@ function ChatSidebar({
                 type="text"
                 value={contactIdentifier}
                 onChange={(e) => setContactIdentifier(e.target.value)}
-                placeholder="Search name or number"
+                placeholder={isInternalUser ? 'Search external user by id/number' : 'Enter agent unique id / number'}
                 className="w-full border-none bg-transparent px-0 py-0 text-sm outline-none placeholder:text-[#6f7f89]"
                 autoFocus
               />
             </div>
-            <p className="px-1 text-[11px] text-[#6b7a84]">Press Enter to add the matched user.</p>
+            <p className="px-1 text-[11px] text-[#6b7a84]">
+              {isInternalUser
+                ? 'Press Enter to connect with the matched external user.'
+                : 'Press Enter to connect with the matched agent.'}
+            </p>
           </form>
 
           <div className="space-y-2 px-4">
