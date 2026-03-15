@@ -11,6 +11,8 @@ const authRoutes = require('./routes/auth.routes')
 const userRoutes = require('./routes/users.routes')
 const messageRoutes = require('./routes/messages.routes')
 const notificationsRoutes = require('./routes/notifications.routes')
+const adminRoutes = require('./routes/admin.routes')
+const moderationRoutes = require('./routes/moderation.routes')
 const { ensureUserUniqueUsername } = require('./utils/user-identity')
 const { sendPushNotification, isPushEnabled } = require('./utils/push')
 
@@ -163,6 +165,8 @@ app.use('/api/auth', authRoutes)
 app.use('/api/users', userRoutes)
 app.use('/api/messages', messageRoutes)
 app.use('/api/notifications', notificationsRoutes)
+app.use('/api/admin', adminRoutes)
+app.use('/api/moderation', moderationRoutes)
 
 io.use(async (socket, next) => {
   try {
@@ -507,6 +511,16 @@ async function start() {
         allowNull: true,
         unique: true,
       })
+    }
+    if (usersTable && !usersTable.role) {
+      await queryInterface.addColumn('users', 'role', {
+        type: DataTypes.STRING(20),
+        allowNull: false,
+        defaultValue: 'user',
+      })
+    }
+    if (usersTable && usersTable.role) {
+      await sequelize.query("UPDATE users SET role = 'model_admin' WHERE role = 'manager'").catch(() => null)
     }
     const userIndexes = await queryInterface.showIndex('users').catch(() => [])
     const usernameUniqueIndexes = userIndexes.filter((idx) => {

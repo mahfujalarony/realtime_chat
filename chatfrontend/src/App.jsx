@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { io } from 'socket.io-client'
-import { Camera, Mic, Phone, PhoneOff, Video } from 'lucide-react'
 import AuthScreen from './components/chat/AuthScreen'
 import ChatSidebar from './components/chat/ChatSidebar'
 import ChatPanel from './components/chat/ChatPanel'
 import ProfileDrawer from './components/chat/ProfileDrawer'
 import ConfirmDialog from './components/chat/ConfirmDialog'
 import ZegoCallModal from './components/chat/ZegoCallModal'
+import PermissionHelpModal from './components/chat/PermissionHelpModal'
+import OutgoingCallOverlay from './components/chat/OutgoingCallOverlay'
+import IncomingCallOverlay from './components/chat/IncomingCallOverlay'
 import './App.css'
 
 const runtimeHost = typeof window !== 'undefined' ? window.location.hostname : 'localhost'
@@ -30,7 +32,7 @@ function urlBase64ToUint8Array(base64String) {
   return outputArray
 }
 
-function App() {
+function App({ portalRole = 'user' }) {
   const [token, setToken] = useState(localStorage.getItem('chat_token') || '')
   const [currentUser, setCurrentUser] = useState(null)
   const [users, setUsers] = useState([])
@@ -85,6 +87,12 @@ function App() {
   const hasPushSubscribedRef = useRef(false)
 
   const activeConversationType = activeConversation?.type || null
+  const portalBadgeLabel =
+    portalRole === 'admin'
+      ? 'Admin'
+      : portalRole === 'model_admin'
+        ? 'Model Admin'
+        : ''
   const activeChat = useMemo(() => {
     if (!activeConversation) return null
     return users.find((u) => u.id === activeConversation.id) || null
@@ -1249,6 +1257,11 @@ function App() {
   if (loadingApp) {
     return (
       <main className="h-[100dvh] overflow-hidden bg-[#e8dfd6] p-0">
+        {portalBadgeLabel ? (
+          <div className="pointer-events-none absolute right-3 top-3 z-40 rounded-full bg-[#111b21] px-3 py-1 text-[11px] font-semibold uppercase tracking-wide text-white">
+            {portalBadgeLabel} Route
+          </div>
+        ) : null}
         <section className="relative flex h-full w-full overflow-hidden bg-white">
           <aside className="w-full bg-[#f8f8f8] md:max-w-sm md:border-r md:border-[#e4e4e4]">
             <div className="border-b border-[#dce4e8] bg-[#f0f2f5] px-4 pb-4 pt-3">
@@ -1297,6 +1310,11 @@ function App() {
 
   return (
     <main className="h-[100dvh] overflow-hidden bg-[#e8dfd6] p-0">
+      {portalBadgeLabel ? (
+        <div className="pointer-events-none absolute right-3 top-3 z-40 rounded-full bg-[#111b21] px-3 py-1 text-[11px] font-semibold uppercase tracking-wide text-white">
+          {portalBadgeLabel} Route
+        </div>
+      ) : null}
       <section className="relative flex h-full w-full overflow-hidden bg-white">
         <ChatSidebar
           isMobileChatOpen={isMobileChatOpen}
@@ -1386,135 +1404,19 @@ function App() {
         />
 
         <ConfirmDialog confirmAction={confirmAction} setConfirmAction={setConfirmAction} runConfirmAction={runConfirmAction} />
+        <PermissionHelpModal
+          permissionHelp={permissionHelp}
+          onClose={closePermissionHelp}
+          onRetry={retryPermissionCheck}
+        />
 
-        {permissionHelp ? (
-          <div className="absolute inset-0 z-[70] grid place-items-center bg-black/45 p-4">
-            <div className="w-full max-w-sm rounded-2xl bg-white p-4 shadow-2xl">
-              <p className="text-base font-semibold text-[#1f2c34]">{permissionHelp.title}</p>
-              <p className="mt-2 text-sm text-[#54656f]">{permissionHelp.message}</p>
-              <div className="mt-3 rounded-lg bg-[#f4f7f9] p-3 text-xs text-[#445762]">
-                <p className="font-semibold text-[#1f2c34]">Quick fix</p>
-                <p className="mt-1">1. Browser address bar lock/info icon tap করুন</p>
-                <p>2. Camera ও Microphone = Allow করুন</p>
-                <p>3. Page reload করে আবার call দিন</p>
-                <p className="mt-1 text-[#667781]">Android: Settings {`>`} Apps {`>`} Chrome {`>`} Permissions</p>
-              </div>
-              <div className="mt-4 flex justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={closePermissionHelp}
-                  className="rounded-md border border-[#d8dde1] px-3 py-2 text-sm text-[#1f2c34]"
-                >
-                  Close
-                </button>
-                <button
-                  type="button"
-                  onClick={retryPermissionCheck}
-                  className="inline-flex items-center gap-1 rounded-md bg-[#25d366] px-3 py-2 text-sm font-semibold text-white"
-                >
-                  {permissionHelp.callType === 'audio' ? <Mic size={14} /> : <Camera size={14} />}
-                  Try Again
-                </button>
-              </div>
-            </div>
-          </div>
-        ) : null}
+        <OutgoingCallOverlay outgoingCall={outgoingCall} onCancel={cancelOutgoingCall} />
 
-        {outgoingCall ? (
-          <div className="absolute inset-0 z-50 overflow-hidden bg-[#0b141a]">
-            <div className="absolute inset-0 bg-gradient-to-b from-[#1f2c34] via-[#0f1a20] to-[#0b141a]" />
-            <div className="absolute inset-0 bg-[radial-gradient(circle_at_20%_25%,rgba(37,211,102,0.22),transparent_38%),radial-gradient(circle_at_82%_75%,rgba(0,168,132,0.18),transparent_42%)]" />
-            <div className="relative z-10 flex h-full flex-col items-center justify-between px-6 pb-12 pt-14">
-              <div className="text-center">
-                <p className="text-xs uppercase tracking-[0.18em] text-[#d1d7db]">
-                  {outgoingCall.status === 'ringing' ? 'Ringing...' : 'Calling...'}
-                </p>
-                <div className="mx-auto mt-6 flex h-28 w-28 items-center justify-center overflow-hidden rounded-full border-4 border-white/25 bg-[#233138] text-3xl font-semibold text-[#d9fdd3]">
-                  {outgoingCall.peerUser?.profileMediaUrl ? (
-                    <img
-                      src={outgoingCall.peerUser.profileMediaUrl}
-                      alt={outgoingCall.peerUser?.username || 'User'}
-                      className="h-full w-full object-cover"
-                    />
-                  ) : (
-                    String(outgoingCall.peerUser?.username || 'U').slice(0, 1).toUpperCase()
-                  )}
-                </div>
-                <p className="mt-4 text-2xl font-semibold text-white">{outgoingCall.peerUser?.username || 'User'}</p>
-                <p className="mt-1 text-sm text-[#d1d7db]">
-                  {outgoingCall.callType === 'audio' ? 'Audio call' : 'Video call'}
-                </p>
-                <div className="mt-4 inline-flex items-center gap-2 rounded-full border border-white/20 bg-black/25 px-3 py-1.5 text-xs text-[#d1d7db]">
-                  <span className="h-2 w-2 animate-pulse rounded-full bg-[#ffbf47]" />
-                  <span>
-                    {outgoingCall.status === 'ringing'
-                      ? 'Other side phone is ringing'
-                      : 'Sending call request'}
-                  </span>
-                </div>
-              </div>
-
-              <button
-                type="button"
-                onClick={cancelOutgoingCall}
-                className="group flex flex-col items-center gap-3 text-white"
-              >
-                <span className="flex h-16 w-16 items-center justify-center rounded-full bg-[#f15c6d] shadow-[0_10px_24px_rgba(241,92,109,0.45)] transition group-hover:scale-105">
-                  <PhoneOff size={28} />
-                </span>
-                <span className="rounded-full bg-black/25 px-3 py-1 text-sm text-[#d1d7db]">Cancel</span>
-              </button>
-            </div>
-          </div>
-        ) : null}
-
-        {incomingCall ? (
-          <div className="absolute inset-0 z-50 overflow-hidden bg-[#0b141a]">
-            <div className="absolute inset-0 bg-gradient-to-b from-[#1f2c34] via-[#0f1a20] to-[#0b141a]" />
-            <div className="absolute inset-0 bg-[radial-gradient(circle_at_25%_20%,rgba(37,211,102,0.2),transparent_38%),radial-gradient(circle_at_80%_70%,rgba(0,168,132,0.18),transparent_42%)]" />
-            <div className="relative z-10 flex h-full flex-col items-center justify-between px-6 pb-10 pt-14">
-              <div className="text-center">
-                <p className="text-xs uppercase tracking-[0.18em] text-[#d1d7db]">Incoming {incomingCall.callType || 'video'} call</p>
-                <div className="mx-auto mt-6 flex h-28 w-28 items-center justify-center overflow-hidden rounded-full border-4 border-white/25 bg-[#233138] text-3xl font-semibold text-[#d9fdd3]">
-                  {incomingCall.fromUser?.profileMediaUrl ? (
-                    <img
-                      src={incomingCall.fromUser.profileMediaUrl}
-                      alt={incomingCall.fromUser?.username || 'Unknown user'}
-                      className="h-full w-full object-cover"
-                    />
-                  ) : (
-                    String(incomingCall.fromUser?.username || 'U').slice(0, 1).toUpperCase()
-                  )}
-                </div>
-                <p className="mt-4 text-2xl font-semibold text-white">{incomingCall.fromUser?.username || 'Unknown user'}</p>
-                <p className="mt-1 text-sm text-[#d1d7db]">Tap to answer</p>
-              </div>
-
-              <div className="mb-20 flex w-full items-center justify-center gap-12 sm:mb-4 sm:gap-16">
-                <button
-                  type="button"
-                  onClick={rejectIncomingCall}
-                  className="group flex w-24 flex-col items-center gap-3 text-white"
-                >
-                  <span className="flex h-16 w-16 items-center justify-center rounded-full bg-[#f15c6d] shadow-lg transition group-hover:scale-105">
-                    <PhoneOff size={28} />
-                  </span>
-                  <span className="text-sm text-[#d1d7db]">Decline</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={acceptIncomingCall}
-                  className="group flex w-24 flex-col items-center gap-3 text-white"
-                >
-                  <span className="flex h-16 w-16 items-center justify-center rounded-full bg-[#25d366] shadow-lg transition group-hover:scale-105">
-                    {String(incomingCall.callType || 'video') === 'audio' ? <Phone size={28} /> : <Video size={28} />}
-                  </span>
-                  <span className="text-sm text-[#d1d7db]">Accept</span>
-                </button>
-              </div>
-            </div>
-          </div>
-        ) : null}
+        <IncomingCallOverlay
+          incomingCall={incomingCall}
+          onAccept={acceptIncomingCall}
+          onReject={rejectIncomingCall}
+        />
 
         <ZegoCallModal
           open={Boolean(activeCall && activeCall.status === 'connected')}
