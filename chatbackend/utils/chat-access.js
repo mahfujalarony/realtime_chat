@@ -1,4 +1,6 @@
-const { Contact, ConversationAssignment } = require('../models')
+const { Op } = require('sequelize')
+const { Contact, ConversationAssignment, UserBlock } = require('../models')
+const { ensureContactPairs } = require('./contact-write')
 
 function normalizeRole(user) {
   return String(user?.role || 'user')
@@ -14,6 +16,10 @@ function isModelAdmin(user) {
 
 function canHandleExternal(user) {
   return isAdmin(user) || isModelAdmin(user) || Boolean(user?.canHandleExternalChat)
+}
+
+function canBlockUsers(user) {
+  return isAdmin(user) || isModelAdmin(user) || Boolean(user?.canBlockUsers)
 }
 
 function isExternalUser(user) {
@@ -34,14 +40,10 @@ function getExternalAndInternal(userA, userB) {
 }
 
 async function ensureMutualContact(userAId, userBId) {
-  await Contact.findOrCreate({
-    where: { userId: userAId, contactUserId: userBId },
-    defaults: { userId: userAId, contactUserId: userBId },
-  })
-  await Contact.findOrCreate({
-    where: { userId: userBId, contactUserId: userAId },
-    defaults: { userId: userBId, contactUserId: userAId },
-  })
+  await ensureContactPairs([
+    { userId: userAId, contactUserId: userBId },
+    { userId: userBId, contactUserId: userAId },
+  ])
 }
 
 async function getOrCreateAssignmentForPair({
@@ -63,9 +65,47 @@ async function getOrCreateAssignmentForPair({
   return assignment
 }
 
+async function getBlockState(requestUserId, otherUserId) {
+  const normalizedRequestUserId = Number(requestUserId)
+  const normalizedOtherUserId = Number(otherUserId)
+  if (!Number.isInteger(normalizedRequestUserId) || !Number.isInteger(normalizedOtherUserId)) {
+    return { isBlockedByMe: false, hasBlockedMe: false, blocked: false }
+  }
+
+  const rows = await UserBlock.findAll({
+    where: {
+      [Op.or]: [
+        { blockerId: normalizedRequestUserId, blockedUserId: normalizedOtherUserId },
+        { blockerId: normalizedOtherUserId, blockedUserId: normalizedRequestUserId },
+      ],
+    },
+    attributes: ['blockerId', 'blockedUserId'],
+    raw: true,
+  })
+
+  const isBlockedByMe = rows.some(
+    (row) => Number(row.blockerId) === normalizedRequestUserId && Number(row.blockedUserId) === normalizedOtherUserId,
+  )
+  const hasBlockedMe = rows.some(
+    (row) => Number(row.blockerId) === normalizedOtherUserId && Number(row.blockedUserId) === normalizedRequestUserId,
+  )
+
+  return {
+    isBlockedByMe,
+    hasBlockedMe,
+    blocked: isBlockedByMe || hasBlockedMe,
+  }
+}
+
 async function canAccessPairConversation(requestUser, otherUser) {
   if (!requestUser || !otherUser) {
     return { ok: false, reason: 'User not found', assignment: null, externalUser: null, internalUser: null }
+  }
+  if (Number(requestUser.id) === Number(otherUser.id)) {
+    return { ok: false, reason: 'You cannot chat with yourself', assignment: null, externalUser: null, internalUser: null }
+  }
+  if (isAdmin(requestUser) && !isExternalUser(otherUser)) {
+    return { ok: true, reason: '', assignment: null, externalUser: null, internalUser: null }
   }
   if (!isValidConversationPair(requestUser, otherUser)) {
     return { ok: false, reason: 'Only external <> internal conversation is allowed', assignment: null, externalUser: null, internalUser: null }
@@ -77,25 +117,15 @@ async function canAccessPairConversation(requestUser, otherUser) {
   })
 
   if (!assignment) {
-    if (isExternalUser(requestUser)) {
-      return { ok: false, reason: 'Conversation is not assigned yet', assignment: null, externalUser, internalUser }
-    }
     assignment = await ConversationAssignment.create({
       externalUserId: externalUser.id,
       assignedToUserId: internalUser.id,
+      publicHandlerUserId: internalUser.id,
       assignedByUserId: isAdmin(requestUser) ? requestUser.id : null,
     })
   }
 
-  if (isAdmin(requestUser)) {
-    return { ok: true, reason: '', assignment, externalUser, internalUser }
-  }
-
   if (isExternalUser(requestUser)) {
-    const allowedPublicId = Number(assignment.publicHandlerUserId || assignment.assignedToUserId)
-    if (allowedPublicId !== Number(otherUser.id)) {
-      return { ok: false, reason: 'You are assigned to another agent', assignment, externalUser, internalUser }
-    }
     return { ok: true, reason: '', assignment, externalUser, internalUser }
   }
 
@@ -105,14 +135,30 @@ async function canAccessPairConversation(requestUser, otherUser) {
   return { ok: true, reason: '', assignment, externalUser, internalUser }
 }
 
+async function canSendToUser(requestUser, otherUser) {
+  if (!requestUser || !otherUser) {
+    return { ok: false, reason: 'User not found', blockState: { isBlockedByMe: false, hasBlockedMe: false, blocked: false } }
+  }
+
+  const blockState = await getBlockState(requestUser.id, otherUser.id)
+  if (blockState.blocked) {
+    return { ok: false, reason: 'You can no longer message each other', blockState }
+  }
+
+  return { ok: true, reason: '', blockState }
+}
+
 module.exports = {
   isAdmin,
   isModelAdmin,
   canHandleExternal,
+  canBlockUsers,
   isExternalUser,
   isValidConversationPair,
   getExternalAndInternal,
   ensureMutualContact,
   getOrCreateAssignmentForPair,
   canAccessPairConversation,
+  getBlockState,
+  canSendToUser,
 }

@@ -50,8 +50,12 @@ module.exports = (sequelize, DataTypes) => {
         type: DataTypes.STRING(500),
         allowNull: true,
       },
+      profileNote: {
+        type: DataTypes.TEXT,
+        allowNull: true,
+      },
       role: {
-        type: DataTypes.STRING(20),
+        type: DataTypes.ENUM('user', 'model_admin', 'admin'),
         allowNull: false,
         defaultValue: 'user',
         validate: {
@@ -64,6 +68,16 @@ module.exports = (sequelize, DataTypes) => {
         defaultValue: false,
       },
       canDownloadConversations: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: false,
+      },
+      canEditConversationNote: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: false,
+      },
+      canBlockUsers: {
         type: DataTypes.BOOLEAN,
         allowNull: false,
         defaultValue: false,

@@ -1,6 +1,6 @@
-const jwt = require('jsonwebtoken')
 const { User } = require('../models')
 const { ensureUserUniqueUsername } = require('../utils/user-identity')
+const { verifyAccessToken } = require('../utils/token')
 
 async function authMiddleware(req, res, next) {
   try {
@@ -11,7 +11,7 @@ async function authMiddleware(req, res, next) {
       return res.status(401).json({ message: 'Unauthorized: token missing' })
     }
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'dev_secret_change_me')
+    const decoded = verifyAccessToken(token)
     const user = await User.findByPk(decoded.userId)
 
     if (!user) {

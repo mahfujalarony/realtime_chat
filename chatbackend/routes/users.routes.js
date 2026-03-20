@@ -1,48 +1,29 @@
 const express = require('express')
 const { Op, QueryTypes } = require('sequelize')
 const authMiddleware = require('../middleware/auth')
-const { User, Contact, Message, ConversationAssignment, sequelize } = require('../models')
+const { User, Contact, Message, ConversationAssignment, UserBlock, sequelize } = require('../models')
 const { UPLOAD_SERVER_URL } = require('../utils/upload-server')
 const {
   isAdmin,
+  canBlockUsers,
   canHandleExternal,
   isExternalUser,
   isValidConversationPair,
   getExternalAndInternal,
   getOrCreateAssignmentForPair,
+  getBlockState,
 } = require('../utils/chat-access')
 
 const router = express.Router()
 
 async function resolveUserByIdentifier(identifier) {
-  const numericId = Number(identifier)
-  if (Number.isInteger(numericId) && String(numericId) === String(identifier).trim()) {
-    const byId = await User.findOne({
-      where: { id: numericId },
-      attributes: ['id', 'username', 'uniqueUsername', 'role', 'canHandleExternalChat', 'email', 'mobileNumber', 'lastSeen', 'profileMediaUrl', 'createdAt'],
-    })
-    if (byId) return byId
-  }
-
   const directMatch = await User.findOne({
     where: {
       [Op.or]: [{ uniqueUsername: identifier }, { email: identifier }, { mobileNumber: identifier }],
     },
-    attributes: ['id', 'username', 'uniqueUsername', 'role', 'canHandleExternalChat', 'email', 'mobileNumber', 'lastSeen', 'profileMediaUrl', 'createdAt'],
+    attributes: ['id', 'username', 'uniqueUsername', 'role', 'canHandleExternalChat', 'email', 'mobileNumber', 'dateOfBirth', 'lastSeen', 'profileMediaUrl', 'createdAt'],
   })
   if (directMatch) return directMatch
-
-  const sameNameUsers = await User.findAll({
-    where: { username: identifier },
-    attributes: ['id', 'username', 'uniqueUsername', 'role', 'canHandleExternalChat', 'email', 'mobileNumber', 'lastSeen', 'profileMediaUrl', 'createdAt'],
-    limit: 2,
-  })
-  if (sameNameUsers.length === 1) return sameNameUsers[0]
-  if (sameNameUsers.length > 1) {
-    const error = new Error('Multiple users found with this name. Please search by unique username/email/mobile')
-    error.statusCode = 409
-    throw error
-  }
   return null
 }
 
@@ -55,7 +36,7 @@ function extractUploadProfilePath(mediaUrl) {
         ? raw
         : new URL(raw).pathname,
     )
-    const match = pathname.match(/\/uploads\/chat\/([^/]+)\/profile\/([^/]+)$/)
+    const match = pathname.match(/\/public\/chat\/([^/]+)\/profile\/([^/]+)$/)
     if (!match) return null
     return {
       uniqueUsername: match[1],
@@ -98,8 +79,10 @@ function serializeLookupUser(user) {
     uniqueUsername: user.uniqueUsername,
     role: user.role || 'user',
     canHandleExternalChat: Boolean(user.canHandleExternalChat),
+    canBlockUsers: Boolean(user.canBlockUsers),
     email: user.email,
     mobileNumber: user.mobileNumber,
+    dateOfBirth: user.dateOfBirth || null,
     lastSeen: user.lastSeen,
     profileMediaUrl: user.profileMediaUrl,
     createdAt: user.createdAt,
@@ -118,11 +101,10 @@ router.get('/', authMiddleware, async (req, res) => {
     const q = (req.query.q || '').trim()
     const requestedLimit = Number(req.query.limit)
     const limit = Number.isInteger(requestedLimit) ? Math.max(10, Math.min(100, requestedLimit)) : 30
-    const requestedPage = Number(req.query.page)
-    const page = Number.isInteger(requestedPage) && requestedPage > 0 ? requestedPage : 1
-    const offset = (page - 1) * limit
+    const cursorTime = String(req.query.cursorTime || '').trim()
+    const cursorId = Number(req.query.cursorId)
+    const hasCursor = Boolean(cursorTime) && Number.isInteger(cursorId) && cursorId > 0
     const likeQ = `%${q}%`
-
     const filterClause = q
       ? `AND (
           u.username LIKE :likeQ
@@ -132,97 +114,128 @@ router.get('/', authMiddleware, async (req, res) => {
         )`
       : ''
 
-    const [{ total = 0 } = { total: 0 }] = await sequelize.query(
+    const cursorClause = hasCursor
+      ? `
+        AND (
+          ranked.sortBucket > :cursorBucket
+          OR (ranked.sortBucket = :cursorBucket AND ranked.sortTime < :cursorSortTime)
+          OR (ranked.sortBucket = :cursorBucket AND ranked.sortTime = :cursorSortTime AND ranked.id > :cursorId)
+        )
       `
-      SELECT COUNT(*) AS total
-      FROM contacts c
-      INNER JOIN users u ON u.id = c.contact_user_id
-      WHERE c.user_id = :currentUserId
-      ${filterClause}
-      `,
-      {
-        replacements: { currentUserId: req.user.id, likeQ },
-        type: QueryTypes.SELECT,
-      },
-    )
+      : ''
+
+    let cursorBucket = 0
+    let cursorSortTime = null
+    if (hasCursor) {
+      cursorSortTime = cursorTime
+      cursorBucket = cursorTime ? 0 : 1
+    }
 
     const rows = await sequelize.query(
       `
-      SELECT
-        u.id AS id,
-        u.username AS username,
-        u.unique_username AS uniqueUsername,
-        u.role AS role,
-        u.can_handle_external_chat AS canHandleExternalChat,
-        u.email AS email,
-        u.mobile_number AS mobileNumber,
-        u.last_seen AS lastSeen,
-        u.profile_media_url AS profileMediaUrl,
-        u.created_at AS createdAt,
-        (
-          SELECT MAX(m.created_at)
-          FROM messages m
-          WHERE
-            (m.sender_id = :currentUserId AND m.receiver_id = u.id)
-            OR
-            (m.sender_id = u.id AND m.receiver_id = :currentUserId)
-        ) AS lastMessageAt,
-        (
-          SELECT COUNT(*)
-          FROM messages um
-          WHERE
-            um.receiver_id = :currentUserId
-            AND um.sender_id = u.id
-            AND um.seen = 0
-        ) AS unreadCount
-      FROM contacts c
-      INNER JOIN users u ON u.id = c.contact_user_id
-      WHERE c.user_id = :currentUserId
-      ${filterClause}
-      ORDER BY
-        CASE
-          WHEN (
-            SELECT MAX(m2.created_at)
-            FROM messages m2
+      SELECT *
+      FROM (
+        SELECT
+          u.id AS id,
+          u.username AS username,
+          u.unique_username AS uniqueUsername,
+          u.role AS role,
+          u.can_handle_external_chat AS canHandleExternalChat,
+          u.email AS email,
+          u.mobile_number AS mobileNumber,
+          u.date_of_birth AS dateOfBirth,
+          u.last_seen AS lastSeen,
+          u.profile_media_url AS profileMediaUrl,
+          u.created_at AS createdAt,
+          EXISTS(
+            SELECT 1
+            FROM user_blocks ub_blocked
+            WHERE ub_blocked.blocker_id = :currentUserId
+              AND ub_blocked.blocked_user_id = u.id
+          ) AS isBlockedByMe,
+          EXISTS(
+            SELECT 1
+            FROM user_blocks ub_blocked_me
+            WHERE ub_blocked_me.blocker_id = u.id
+              AND ub_blocked_me.blocked_user_id = :currentUserId
+          ) AS hasBlockedMe,
+          (
+            SELECT MAX(m.created_at)
+            FROM messages m
             WHERE
-              (m2.sender_id = :currentUserId AND m2.receiver_id = u.id)
+              (m.sender_id = :currentUserId AND m.receiver_id = u.id)
               OR
-              (m2.sender_id = u.id AND m2.receiver_id = :currentUserId)
-          ) IS NULL THEN 1
-          ELSE 0
-        END ASC,
-        (
-          SELECT MAX(m3.created_at)
-          FROM messages m3
-          WHERE
-            (m3.sender_id = :currentUserId AND m3.receiver_id = u.id)
-            OR
-            (m3.sender_id = u.id AND m3.receiver_id = :currentUserId)
-        ) DESC,
-        u.username ASC
-      LIMIT :limit OFFSET :offset
+              (m.sender_id = u.id AND m.receiver_id = :currentUserId)
+          ) AS lastMessageAt,
+          (
+            SELECT COUNT(*)
+            FROM messages um
+            WHERE
+              um.receiver_id = :currentUserId
+              AND um.sender_id = u.id
+              AND um.seen = 0
+          ) AS unreadCount,
+          CASE
+            WHEN (
+              SELECT MAX(m2.created_at)
+              FROM messages m2
+              WHERE
+                (m2.sender_id = :currentUserId AND m2.receiver_id = u.id)
+                OR
+                (m2.sender_id = u.id AND m2.receiver_id = :currentUserId)
+            ) IS NULL THEN 1
+            ELSE 0
+          END AS sortBucket,
+          COALESCE((
+            SELECT MAX(m3.created_at)
+            FROM messages m3
+            WHERE
+              (m3.sender_id = :currentUserId AND m3.receiver_id = u.id)
+              OR
+              (m3.sender_id = u.id AND m3.receiver_id = :currentUserId)
+          ), u.created_at) AS sortTime
+        FROM contacts c
+        INNER JOIN users u ON u.id = c.contact_user_id
+        WHERE c.user_id = :currentUserId
+        ${filterClause}
+      ) ranked
+      WHERE 1 = 1
+      ${cursorClause}
+      ORDER BY ranked.sortBucket ASC, ranked.sortTime DESC, ranked.id ASC
+      LIMIT :cursorLimit
       `,
       {
         replacements: {
           currentUserId: req.user.id,
           likeQ,
-          limit,
-          offset,
+          cursorBucket,
+          cursorSortTime,
+          cursorId,
+          cursorLimit: limit + 1,
         },
         type: QueryTypes.SELECT,
       },
     )
 
     const onlineUserSockets = req.app.get('onlineUserSockets') || new Map()
-    const users = rows.map((row) => ({
+    const hasMore = rows.length > limit
+    const trimmedRows = hasMore ? rows.slice(0, limit) : rows
+    const users = trimmedRows.map((row) => ({
       ...row,
       canHandleExternalChat: Boolean(row.canHandleExternalChat),
       unreadCount: Number(row.unreadCount) || 0,
+      isBlockedByMe: Boolean(row.isBlockedByMe),
+      hasBlockedMe: Boolean(row.hasBlockedMe),
       isOnline: onlineUserSockets.has(Number(row.id)),
     }))
-
-    const hasMore = offset + users.length < Number(total || 0)
-    return res.json({ users, page, limit, hasMore })
+    const lastItem = trimmedRows[trimmedRows.length - 1] || null
+    const nextCursor = hasMore && lastItem
+      ? {
+          cursorTime: lastItem.sortTime || lastItem.createdAt || '',
+          cursorId: Number(lastItem.id),
+        }
+      : null
+    return res.json({ users, limit, hasMore, nextCursor })
   } catch (error) {
     return res.status(500).json({ message: 'Failed to load users', error: error.message })
   }
@@ -243,6 +256,19 @@ router.post('/contacts', authMiddleware, async (req, res) => {
     if (targetUser.id === req.user.id) {
       return res.status(400).json({ message: 'You cannot add yourself as contact' })
     }
+    const blockState = await getBlockState(req.user.id, targetUser.id)
+    if (blockState.hasBlockedMe) {
+      return res.status(403).json({ message: 'This user blocked you' })
+    }
+
+    if (isAdmin(req.user) && !isExternalUser(targetUser)) {
+      await ensureOneWayContact(req.user.id, targetUser.id)
+      return res.status(201).json({
+        message: 'Conversation added successfully',
+        contact: serializeLookupUser(targetUser),
+        assignment: null,
+      })
+    }
 
     if (!isValidConversationPair(req.user, targetUser)) {
       return res.status(403).json({ message: 'Only external user and internal team member chat is allowed' })
@@ -257,21 +283,10 @@ router.post('/contacts', authMiddleware, async (req, res) => {
       where: { externalUserId: externalUser.id },
     })
 
-    if (isExternalUser(req.user) && assignment) {
-      const publicHandlerId = Number(assignment.publicHandlerUserId || assignment.assignedToUserId)
-      if (publicHandlerId !== Number(targetUser.id)) {
-        return res.status(403).json({ message: 'Please use your assigned team member unique id' })
-      }
-    }
-
     if (assignment && Number(assignment.assignedToUserId) !== Number(internalUser.id)) {
-      if (!isAdmin(req.user)) {
-        return res.status(403).json({ message: 'This conversation is assigned to another team member' })
-      }
-      assignment.assignedToUserId = internalUser.id
-      assignment.assignedByUserId = req.user.id
-      await assignment.save()
-    } else if (!assignment) {
+      return res.status(403).json({ message: 'This conversation is assigned to another team member' })
+    }
+    if (!assignment) {
       assignment = await getOrCreateAssignmentForPair({
         externalUser,
         internalUser,
@@ -318,6 +333,21 @@ router.get('/lookup', authMiddleware, async (req, res) => {
         isSelf: true,
       })
     }
+    const blockState = await getBlockState(req.user.id, targetUser.id)
+    if (blockState.hasBlockedMe) {
+      return res.status(403).json({ message: 'This user blocked you' })
+    }
+
+    if (isAdmin(req.user) && !isExternalUser(targetUser)) {
+      const contact = await Contact.findOne({
+        where: { userId: req.user.id, contactUserId: targetUser.id },
+      })
+      return res.json({
+        user: serializeLookupUser(targetUser),
+        alreadyContact: Boolean(contact),
+        isSelf: false,
+      })
+    }
 
     if (!isValidConversationPair(req.user, targetUser)) {
       return res.status(403).json({ message: 'This user cannot be added to your chat list' })
@@ -329,7 +359,7 @@ router.get('/lookup', authMiddleware, async (req, res) => {
     const assignment = await ConversationAssignment.findOne({
       where: { externalUserId: externalUser.id },
     })
-    const blockedByAssignment = assignment && !isAdmin(req.user) && (
+    const blockedByAssignment = assignment && (
       isExternalUser(req.user)
         ? Number(assignment.publicHandlerUserId || assignment.assignedToUserId) !== Number(targetUser.id)
         : Number(assignment.assignedToUserId) !== Number(internalUser.id)
@@ -356,24 +386,7 @@ router.get('/lookup', authMiddleware, async (req, res) => {
 })
 
 router.delete('/contacts/:contactUserId', authMiddleware, async (req, res) => {
-  try {
-    const contactUserId = Number(req.params.contactUserId)
-    if (!Number.isInteger(contactUserId)) {
-      return res.status(400).json({ message: 'Invalid contactUserId' })
-    }
-
-    const deleted = await Contact.destroy({
-      where: { userId: req.user.id, contactUserId },
-    })
-
-    if (!deleted) {
-      return res.status(404).json({ message: 'Contact not found' })
-    }
-
-    return res.json({ message: 'Contact removed' })
-  } catch (error) {
-    return res.status(500).json({ message: 'Failed to remove contact', error: error.message })
-  }
+  return res.status(403).json({ message: 'Contact removal is disabled.' })
 })
 
 router.post('/profile-media', authMiddleware, async (req, res) => {
@@ -405,14 +418,137 @@ router.post('/profile-media', authMiddleware, async (req, res) => {
         role: req.user.role || 'user',
         canHandleExternalChat: Boolean(req.user.canHandleExternalChat),
         canDownloadConversations: Boolean(req.user.canDownloadConversations),
+        canEditConversationNote: Boolean(req.user.canEditConversationNote),
+        canBlockUsers: Boolean(req.user.canBlockUsers),
         email: req.user.email,
         mobileNumber: req.user.mobileNumber,
         lastSeen: req.user.lastSeen,
         profileMediaUrl: req.user.profileMediaUrl,
+        profileNote: req.user.canEditConversationNote ? (req.user.profileNote || '') : '',
       },
     })
   } catch (error) {
     return res.status(500).json({ message: 'Failed to update profile media', error: error.message })
+  }
+})
+
+router.patch('/profile-note', authMiddleware, async (req, res) => {
+  try {
+    if (!Boolean(req.user?.canEditConversationNote)) {
+      return res.status(403).json({ message: 'Note access is disabled for this account' })
+    }
+
+    const profileNote = String(req.body?.profileNote || '').trim()
+    req.user.profileNote = profileNote || null
+    await req.user.save()
+
+    return res.json({
+      message: 'Profile note updated',
+      user: {
+        id: req.user.id,
+        username: req.user.username,
+        uniqueUsername: req.user.uniqueUsername,
+        role: req.user.role || 'user',
+        canHandleExternalChat: Boolean(req.user.canHandleExternalChat),
+        canDownloadConversations: Boolean(req.user.canDownloadConversations),
+        canEditConversationNote: Boolean(req.user.canEditConversationNote),
+        canBlockUsers: Boolean(req.user.canBlockUsers),
+        email: req.user.email,
+        mobileNumber: req.user.mobileNumber,
+        lastSeen: req.user.lastSeen,
+        profileMediaUrl: req.user.profileMediaUrl,
+        profileNote: req.user.profileNote || '',
+      },
+    })
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to update profile note', error: error.message })
+  }
+})
+
+router.post('/:userId/block', authMiddleware, async (req, res) => {
+  try {
+    if (!canBlockUsers(req.user)) {
+      return res.status(403).json({ message: 'Block access is disabled by admin' })
+    }
+
+    const otherUserId = Number(req.params.userId)
+    if (!Number.isInteger(otherUserId)) {
+      return res.status(400).json({ message: 'Invalid userId' })
+    }
+    if (otherUserId === Number(req.user.id)) {
+      return res.status(400).json({ message: 'You cannot block yourself' })
+    }
+
+    const otherUser = await User.findByPk(otherUserId)
+    if (!otherUser) return res.status(404).json({ message: 'User not found' })
+
+    const blockState = await getBlockState(req.user.id, otherUserId)
+    if (blockState.hasBlockedMe) {
+      return res.status(403).json({ message: 'You cannot block this user until they unblock you' })
+    }
+
+    await UserBlock.findOrCreate({
+      where: { blockerId: req.user.id, blockedUserId: otherUserId },
+      defaults: { blockerId: req.user.id, blockedUserId: otherUserId },
+    })
+
+    const io = req.app.get('io')
+    io.to(`user:${req.user.id}`).emit('chat:block-status-updated', {
+      userId: otherUserId,
+      isBlockedByMe: true,
+      hasBlockedMe: false,
+    })
+    io.to(`user:${otherUserId}`).emit('chat:block-status-updated', {
+      userId: Number(req.user.id),
+      isBlockedByMe: false,
+      hasBlockedMe: true,
+    })
+
+    return res.json({ message: 'User blocked successfully', blockedUserId: otherUserId })
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to block user', error: error.message })
+  }
+})
+
+router.delete('/:userId/block', authMiddleware, async (req, res) => {
+  try {
+    if (!canBlockUsers(req.user)) {
+      return res.status(403).json({ message: 'Block access is disabled by admin' })
+    }
+
+    const otherUserId = Number(req.params.userId)
+    if (!Number.isInteger(otherUserId)) {
+      return res.status(400).json({ message: 'Invalid userId' })
+    }
+    if (otherUserId === Number(req.user.id)) {
+      return res.status(400).json({ message: 'You cannot unblock yourself' })
+    }
+
+    const otherUser = await User.findByPk(otherUserId)
+    if (!otherUser) return res.status(404).json({ message: 'User not found' })
+
+    await UserBlock.destroy({
+      where: { blockerId: req.user.id, blockedUserId: otherUserId },
+    })
+
+    await ensureOneWayContact(req.user.id, otherUserId)
+    await ensureOneWayContact(otherUserId, req.user.id)
+
+    const io = req.app.get('io')
+    io.to(`user:${req.user.id}`).emit('chat:block-status-updated', {
+      userId: otherUserId,
+      isBlockedByMe: false,
+      hasBlockedMe: false,
+    })
+    io.to(`user:${otherUserId}`).emit('chat:block-status-updated', {
+      userId: Number(req.user.id),
+      isBlockedByMe: false,
+      hasBlockedMe: false,
+    })
+
+    return res.json({ message: 'User unblocked successfully', blockedUserId: otherUserId })
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to unblock user', error: error.message })
   }
 })
 

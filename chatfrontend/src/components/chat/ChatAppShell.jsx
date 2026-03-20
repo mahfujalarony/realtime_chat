@@ -11,6 +11,7 @@ function ChatAppShell({
   portalBadgeLabel,
   isMobileChatOpen,
   currentUser,
+  refreshCurrentUser,
   requestLogout,
   searchQuery,
   setSearchQuery,
@@ -21,6 +22,7 @@ function ChatAppShell({
   addingContact,
   uploadingProfile,
   uploadProfileMedia,
+  updateOwnProfileNote,
   error,
   filteredUsers,
   activeConversation,
@@ -38,15 +40,18 @@ function ChatAppShell({
   activeConversationType,
   isProfileOpen,
   setIsProfileOpen,
-  profileMenuOpen,
-  setProfileMenuOpen,
-  requestClearChat,
-  requestDeleteChat,
+  toggleBlockUser,
+  blockingUserId,
+  exportConversationPdf,
+  canExportConversation,
   messageListRef,
   activeMessages,
   activeConversationNote,
+  activeConversationCanEditNote,
+  saveActiveConversationNote,
   requestDeleteMessage,
   requestDeleteMessages,
+  reactToMessage,
   draftMessage,
   setDraftMessage,
   sendMessage,
@@ -87,6 +92,7 @@ function ChatAppShell({
         <ChatSidebar
           isMobileChatOpen={isMobileChatOpen}
           currentUser={currentUser}
+          refreshCurrentUser={refreshCurrentUser}
           logout={requestLogout}
           searchQuery={searchQuery}
           setSearchQuery={setSearchQuery}
@@ -97,6 +103,7 @@ function ChatAppShell({
           addingContact={addingContact}
           uploadingProfile={uploadingProfile}
           onUploadProfile={uploadProfileMedia}
+          onUpdateProfileNote={updateOwnProfileNote}
           error={error}
           filteredUsers={filteredUsers}
           activeConversation={activeConversation}
@@ -121,18 +128,21 @@ function ChatAppShell({
           startAudioCall={() => startDirectCall('audio')}
           startVideoCall={() => startDirectCall('video')}
           getInitials={getInitials}
-          profileMenuOpen={profileMenuOpen}
-          setProfileMenuOpen={setProfileMenuOpen}
-          requestClearChat={requestClearChat}
-          requestDeleteChat={requestDeleteChat}
+          exportConversationPdf={exportConversationPdf}
+          canExportConversation={canExportConversation}
           messageListRef={messageListRef}
           activeMessages={activeMessages}
           currentUser={currentUser}
           formatTime={formatTime}
           formatLastSeen={formatLastSeen}
+          isBlockedByMe={Boolean(activeChat?.isBlockedByMe)}
+          hasBlockedMe={Boolean(activeChat?.hasBlockedMe)}
           activeConversationNote={activeConversationNote}
+          activeConversationCanEditNote={activeConversationCanEditNote}
+          saveActiveConversationNote={saveActiveConversationNote}
           requestDeleteMessage={requestDeleteMessage}
           requestDeleteMessages={requestDeleteMessages}
+          reactToMessage={reactToMessage}
           draftMessage={draftMessage}
           setDraftMessage={setDraftMessage}
           sendMessage={sendMessage}
@@ -151,9 +161,12 @@ function ChatAppShell({
 
         <ProfileDrawer
           activeChat={activeConversationType === 'direct' ? activeChat : null}
+          currentUser={currentUser}
           isProfileOpen={isProfileOpen}
           closeProfile={() => setIsProfileOpen(false)}
           getInitials={getInitials}
+          onToggleBlockUser={toggleBlockUser}
+          blockingUserId={blockingUserId}
         />
 
         <ConfirmDialog confirmAction={confirmAction} setConfirmAction={setConfirmAction} runConfirmAction={runConfirmAction} />

@@ -1,27 +1,10 @@
-const API_URL = import.meta.env.VITE_API_URL || ''
-
-function resolveApiPath(path) {
-  if (!path.startsWith('/')) return path
-  if (API_URL) return `${API_URL}${path}`
-  return path
-}
+import { fetchJsonWithAuth } from '../../lib/auth'
 
 export async function apiFetch(path, options = {}, token = '') {
-  const response = await fetch(resolveApiPath(path), {
-    method: options.method || 'GET',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(options.headers || {}),
-    },
-    body: options.body,
+  return fetchJsonWithAuth(path, options, {
+    tokenOverride: token,
+    skipAuth: !token && /^\/api\/auth\/(login|register)$/i.test(String(path || '')),
   })
-
-  const payload = await response.json().catch(() => ({}))
-  if (!response.ok) {
-    throw new Error(payload?.message || 'Request failed')
-  }
-  return payload
 }
 
 export function formatDateTime(value) {
@@ -29,6 +12,19 @@ export function formatDateTime(value) {
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return '-'
   return date.toLocaleString()
+}
+
+ export function formatRelativeTime(value) {
+  if (!value) return '-'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '-'
+  const diffSec = Math.max(0, Math.floor((Date.now() - date.getTime()) / 1000))
+  if (diffSec < 60) return `${diffSec}s ago`
+  if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`
+  if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h ago`
+  if (diffSec < 86400 * 30) return `${Math.floor(diffSec / 86400)}d ago`
+  if (diffSec < 86400 * 365) return `${Math.floor(diffSec / (86400 * 30))}mo ago`
+  return `${Math.floor(diffSec / (86400 * 365))}y ago`
 }
 
 export function messagePreview(message) {

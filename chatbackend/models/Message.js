@@ -60,6 +60,10 @@ module.exports = (sequelize, DataTypes) => {
         { fields: ['sender_id'] },
         { fields: ['receiver_id'] },
         { fields: ['created_at'] },
+        { fields: ['sender_id', 'created_at'] },
+        { fields: ['receiver_id', 'created_at'] },
+        { fields: ['sender_id', 'id'] },
+        { fields: ['receiver_id', 'id'] },
       ],
     },
   )

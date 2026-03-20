@@ -11,6 +11,6 @@ module.exports = {
 
   ALLOWED_IMAGES: ["image/jpeg", "image/png", "image/webp", "image/gif"],
   ALLOWED_VIDEOS: ["video/mp4", "video/webm", "video/quicktime"],
-  ALLOWED_AUDIOS: ["audio/mpeg", "audio/mp3", "audio/wav", "audio/ogg", "audio/webm", "audio/aac", "audio/m4a"],
+  ALLOWED_AUDIOS: ["audio/mpeg", "audio/mp3", "audio/wav", "audio/ogg", "audio/webm", "audio/aac", "audio/m4a", "audio/mp4"],
   ALLOWED_FILES: ["*"] // Allow all file types for general files
 };

@@ -116,6 +116,58 @@
     --radius-4xl: calc(var(--radius) * 2.6);
 }
 
+/* Reaction bubble appear animation */
+@keyframes reactionPop {
+  0%   { transform: scale(0.5); opacity: 0; }
+  70%  { transform: scale(1.15); opacity: 1; }
+  100% { transform: scale(1); opacity: 1; }
+}
+
+.reaction-pop {
+  animation: reactionPop 0.22s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+}
+
+@keyframes refreshSpringSpin {
+  0% {
+    transform: rotate(0deg) scale(1);
+  }
+  18% {
+    transform: rotate(100deg) scale(0.9);
+  }
+  42% {
+    transform: rotate(230deg) scale(1.14);
+  }
+  68% {
+    transform: rotate(320deg) scale(0.96);
+  }
+  82% {
+    transform: rotate(348deg) scale(1.04);
+  }
+  100% {
+    transform: rotate(360deg) scale(1);
+  }
+}
+
+.refresh-spring-icon {
+  transform-origin: center;
+}
+
+.refresh-spring-icon.is-refreshing {
+  animation: refreshSpringSpin 0.9s cubic-bezier(0.34, 1.56, 0.64, 1) infinite;
+}
+
+.audio-progress-bar {
+  min-width: 0;
+}
+
+.audio-progress-bar:focus-visible {
+  outline: none;
+}
+
+.audio-progress-bar:focus-visible .audio-progress-bar__thumb {
+  box-shadow: 0 0 0 2px #fff, 0 0 0 5px rgba(0, 168, 132, 0.22);
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;

@@ -98,7 +98,7 @@ function ZegoCallModal({
       ) : (
         <div
           ref={containerRef}
-          className="zego-call-mobile-fix h-[100dvh] w-screen overflow-hidden pb-[max(8px,env(safe-area-inset-bottom))]"
+          className="zego-call-mobile-fix h-[100dvh] w-screen overflow-hidden pb-[max(8px,env(safe-area-inset-bottom))] pt-[env(safe-area-inset-top)]"
         />
       )}
     </div>

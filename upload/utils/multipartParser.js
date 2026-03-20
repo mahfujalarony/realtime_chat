@@ -1,14 +1,48 @@
 const fs = require("fs");
 const path = require("path");
 
+const CRLF = Buffer.from("\r\n");
+const HEADER_SEPARATOR = Buffer.from("\r\n\r\n");
+
+function resolveNextSequentialFileName(absoluteDir, extension) {
+  const safeExtension = String(extension || "bin").replace(/^\.+/, "") || "bin";
+  const names = fs.existsSync(absoluteDir) ? fs.readdirSync(absoluteDir) : [];
+  let maxNumber = 0;
+
+  for (const name of names) {
+    const parsed = path.parse(name);
+    const number = Number(parsed.name);
+    if (Number.isInteger(number) && number > maxNumber) {
+      maxNumber = number;
+    }
+  }
+
+  return `${maxNumber + 1}.${safeExtension}`;
+}
+
+function trimPartBuffer(partBuffer) {
+  let start = 0;
+  let end = partBuffer.length;
+
+  if (partBuffer.slice(0, CRLF.length).equals(CRLF)) start += CRLF.length;
+  if (end >= CRLF.length && partBuffer.slice(end - CRLF.length, end).equals(CRLF)) end -= CRLF.length;
+
+  return partBuffer.slice(start, end);
+}
+
 function parseMultipart(req, options) {
   return new Promise((resolve, reject) => {
+    const boundary = req.headers["content-type"]?.split("boundary=")?.[1];
+    if (!boundary) {
+      reject("Invalid multipart boundary");
+      return;
+    }
 
-    const boundary = req.headers["content-type"].split("boundary=")[1];
+    const boundaryBuffer = Buffer.from(`--${boundary}`);
     let buffer = Buffer.alloc(0);
-    let files = [];
+    const files = [];
 
-    req.on("data", chunk => {
+    req.on("data", (chunk) => {
       buffer = Buffer.concat([buffer, chunk]);
 
       if (buffer.length > options.maxSize) {
@@ -17,40 +51,46 @@ function parseMultipart(req, options) {
       }
     });
 
+    req.on("error", reject);
+
     req.on("end", () => {
+      let searchFrom = 0;
 
-      const parts = buffer.toString("binary").split("--" + boundary);
+      while (searchFrom < buffer.length) {
+        const boundaryStart = buffer.indexOf(boundaryBuffer, searchFrom);
+        if (boundaryStart === -1) break;
 
-      parts.forEach(part => {
+        let cursor = boundaryStart + boundaryBuffer.length;
 
-        if (!part.includes("filename")) return;
+        if (buffer.slice(cursor, cursor + 2).toString("ascii") === "--") break;
 
-        const mime = part.match(/Content-Type:(.*)/)?.[1]?.trim();
-        // Check if file type is allowed - "*" means allow all types
-        // Handle MIME types with codec suffixes like "audio/webm;codecs=opus"
-        const baseMime = mime ? mime.split(';')[0].trim() : '';
-        const isAllowed = options.allowed.includes("*") || options.allowed.includes(mime) || options.allowed.includes(baseMime);
-        if (!isAllowed) return;
+        const nextBoundary = buffer.indexOf(boundaryBuffer, cursor);
+        if (nextBoundary === -1) break;
 
-        // Extract original filename from Content-Disposition header
-        const filenameMatch = part.match(/filename="([^"]+)"/);
+        const partBuffer = trimPartBuffer(buffer.slice(cursor, nextBoundary));
+        searchFrom = nextBoundary;
+
+        if (!partBuffer.length) continue;
+
+        const headerEnd = partBuffer.indexOf(HEADER_SEPARATOR);
+        if (headerEnd === -1) continue;
+
+        const headerText = partBuffer.slice(0, headerEnd).toString("utf8");
+        if (!headerText.includes("filename=")) continue;
+
+        const mime = headerText.match(/Content-Type:\s*([^\r\n]+)/i)?.[1]?.trim();
+        const baseMime = mime ? mime.split(";")[0].trim() : "";
+        const isAllowed =
+          options.allowed.includes("*") ||
+          options.allowed.includes(mime) ||
+          options.allowed.includes(baseMime);
+        if (!isAllowed) continue;
+
+        const filenameMatch = headerText.match(/filename="([^"]+)"/i);
         const originalName = filenameMatch ? filenameMatch[1] : "";
         const originalExt = originalName ? path.extname(originalName).slice(1) : "";
-
-        const uniqueId = Date.now() + "-" + Math.random().toString(36).slice(2);
-        
-        // Use original extension if available, otherwise derive from mime type
-        // Handle MIME types with codec suffixes for extension extraction
         const extension = originalExt || (baseMime ? baseMime.split("/")[1] : "bin");
-
-        // header আর body আলাদা করা - \r\n\r\n দিয়ে
-        const headerEnd = part.indexOf("\r\n\r\n");
-        if (headerEnd === -1) return;
-        let fileData = part.substring(headerEnd + 4);
-        // trailing \r\n সরানো (boundary এর আগের part)
-        if (fileData.endsWith("\r\n")) {
-          fileData = fileData.slice(0, -2);
-        }
+        const fileData = partBuffer.slice(headerEnd + HEADER_SEPARATOR.length);
 
         const rawDir = String(options.uploadDir || "").replace(/\\/g, "/").replace(/^\/+/, "");
         const relativeDir = rawDir.replace(/\/+$/, "");
@@ -58,12 +98,12 @@ function parseMultipart(req, options) {
 
         fs.mkdirSync(absoluteDir, { recursive: true });
 
-        const fileName = `${uniqueId}.${extension}`;
+        const fileName = resolveNextSequentialFileName(absoluteDir, extension);
         const savePath = path.join(absoluteDir, fileName);
-        fs.writeFileSync(savePath, Buffer.from(fileData, "binary"));
+        fs.writeFileSync(savePath, fileData);
 
         files.push(path.posix.join(relativeDir, fileName));
-      });
+      }
 
       resolve(files);
     });

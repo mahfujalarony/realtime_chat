@@ -1,10 +1,11 @@
 const express = require('express')
 const { Op } = require('sequelize')
 const authMiddleware = require('../middleware/auth')
-const { User, sequelize } = require('../models')
-const { signToken } = require('../utils/token')
+const { User, Message, Contact, PushSubscription, ConversationAssignment, sequelize } = require('../models')
+const { signAccessToken, signRefreshToken, verifyRefreshToken } = require('../utils/token')
 const { ensureUserFolder, deleteUserFolder } = require('../utils/upload-server')
 const { buildUnusedUniqueUsername, ensureUserUniqueUsername } = require('../utils/user-identity')
+const { setRefreshTokenCookie, clearRefreshTokenCookie, getRefreshTokenFromRequest } = require('../utils/cookies')
 
 const router = express.Router()
 
@@ -16,13 +17,69 @@ function serializeUser(user) {
     role: user.role || 'user',
     canHandleExternalChat: Boolean(user.canHandleExternalChat),
     canDownloadConversations: Boolean(user.canDownloadConversations),
+    canEditConversationNote: Boolean(user.canEditConversationNote),
+    canBlockUsers: Boolean(user.canBlockUsers),
     email: user.email,
     mobileNumber: user.mobileNumber,
     dateOfBirth: user.dateOfBirth,
     lastSeen: user.lastSeen,
     profileMediaUrl: user.profileMediaUrl,
+    profileNote: user.canEditConversationNote ? (user.profileNote || '') : '',
     createdAt: user.createdAt,
   }
+}
+
+function buildAuthPayload(user) {
+  return {
+    token: signAccessToken(user.id),
+    user: serializeUser(user),
+  }
+}
+
+async function rollbackRegisteredUserArtifacts(userId, uniqueUsername) {
+  const normalizedUserId = Number(userId)
+  const normalizedUniqueUsername = String(uniqueUsername || '').trim()
+
+  if (!Number.isInteger(normalizedUserId) || !normalizedUniqueUsername) {
+    throw new Error('Invalid rollback context')
+  }
+
+  // Delete upload folder first so we don't leave orphaned media after DB cleanup.
+  await deleteUserFolder(normalizedUniqueUsername)
+
+  await sequelize.transaction(async (t) => {
+    await PushSubscription.destroy({
+      where: { userId: normalizedUserId },
+      transaction: t,
+    })
+    await Contact.destroy({
+      where: {
+        [Op.or]: [{ userId: normalizedUserId }, { contactUserId: normalizedUserId }],
+      },
+      transaction: t,
+    })
+    await Message.destroy({
+      where: {
+        [Op.or]: [{ senderId: normalizedUserId }, { receiverId: normalizedUserId }],
+      },
+      transaction: t,
+    })
+    await ConversationAssignment.destroy({
+      where: {
+        [Op.or]: [
+          { externalUserId: normalizedUserId },
+          { assignedToUserId: normalizedUserId },
+          { publicHandlerUserId: normalizedUserId },
+          { assignedByUserId: normalizedUserId },
+        ],
+      },
+      transaction: t,
+    })
+    await User.destroy({
+      where: { id: normalizedUserId },
+      transaction: t,
+    })
+  })
 }
 
 router.post('/register', async (req, res) => {
@@ -83,11 +140,12 @@ router.post('/register', async (req, res) => {
       throw dbError
     }
 
-    const token = signToken(user.id)
+    const refreshToken = signRefreshToken(user.id)
+    const authPayload = buildAuthPayload(user)
+    setRefreshTokenCookie(res, req, refreshToken)
     return res.status(201).json({
       message: 'Registration successful',
-      token,
-      user: serializeUser(user),
+      ...authPayload,
     })
   } catch (error) {
     return res.status(500).json({ message: 'Registration failed', error: error.message })
@@ -103,14 +161,14 @@ router.post('/rollback-registration', authMiddleware, async (req, res) => {
       return res.status(400).json({ message: 'Invalid rollback context' })
     }
 
-    await sequelize.transaction(async (t) => {
-      await User.destroy({ where: { id: userId }, transaction: t })
-    })
-    await deleteUserFolder(uniqueUsername).catch(() => null)
+    await rollbackRegisteredUserArtifacts(userId, uniqueUsername)
 
     return res.json({ message: 'Registration rolled back' })
   } catch (error) {
-    return res.status(500).json({ message: 'Rollback failed', error: error.message })
+    return res.status(500).json({
+      message: 'Rollback failed. Please retry rollback to avoid partial registration.',
+      error: error.message,
+    })
   }
 })
 
@@ -155,19 +213,53 @@ router.post('/login', async (req, res) => {
     user.lastSeen = new Date()
     await user.save()
 
-    const token = signToken(user.id)
+    const refreshToken = signRefreshToken(user.id)
+    const authPayload = buildAuthPayload(user)
+    setRefreshTokenCookie(res, req, refreshToken)
     return res.json({
       message: 'Login successful',
-      token,
-      user: serializeUser(user),
+      ...authPayload,
     })
   } catch (error) {
     return res.status(500).json({ message: 'Login failed', error: error.message })
   }
 })
 
+router.post('/refresh', async (req, res) => {
+  try {
+    const refreshToken = getRefreshTokenFromRequest(req)
+    if (!refreshToken) {
+      return res.status(401).json({ message: 'Unauthorized: refresh token missing' })
+    }
+
+    const decoded = verifyRefreshToken(refreshToken)
+    const user = await User.findByPk(decoded.userId)
+    if (!user) {
+      clearRefreshTokenCookie(res, req)
+      return res.status(401).json({ message: 'Unauthorized: user not found' })
+    }
+
+    await ensureUserUniqueUsername(user, User)
+    const nextRefreshToken = signRefreshToken(user.id)
+    const authPayload = buildAuthPayload(user)
+    setRefreshTokenCookie(res, req, nextRefreshToken)
+    return res.json({
+      message: 'Session refreshed',
+      ...authPayload,
+    })
+  } catch (error) {
+    clearRefreshTokenCookie(res, req)
+    return res.status(401).json({ message: 'Unauthorized: invalid refresh token' })
+  }
+})
+
 router.get('/me', authMiddleware, async (req, res) => {
   return res.json({ user: serializeUser(req.user) })
+})
+
+router.post('/logout', (req, res) => {
+  clearRefreshTokenCookie(res, req)
+  return res.json({ message: 'Logout successful' })
 })
 
 module.exports = router

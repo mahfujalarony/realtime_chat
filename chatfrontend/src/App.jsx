@@ -4,19 +4,22 @@ import AuthScreen from './components/chat/AuthScreen'
 import ChatLoadingScreen from './components/chat/ChatLoadingScreen'
 import ChatAppShell from './components/chat/ChatAppShell'
 import useCallAlerts from './hooks/useCallAlerts'
+import { clearAccessToken, fetchJsonWithAuth, fetchWithAuth, getAccessToken, logoutSession, refreshSession, setAccessToken, subscribeToAuth } from './lib/auth'
 import './App.css'
 
 const runtimeHost = typeof window !== 'undefined' ? window.location.hostname : 'localhost'
 const sameOriginBase = typeof window !== 'undefined' ? window.location.origin : `http://${runtimeHost}:5173`
-const API_URL = import.meta.env.VITE_API_URL || ''
 const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || sameOriginBase
 const UPLOAD_SERVER_URL = import.meta.env.VITE_UPLOAD_SERVER_URL || ''
 const UPLOAD_FILE_FIELD = import.meta.env.VITE_UPLOAD_FILE_FIELD || 'file'
 const CHAT_LIST_PAGE_SIZE = 30
+const MAX_LOADED_SIDEBAR_USERS = 180
+const MAX_PINNED_SIDEBAR_USERS = 24
 const MESSAGE_PAGE_SIZE = 40
 const ZEGO_APP_ID = Number(import.meta.env.VITE_ZEGO_APP_ID || 0)
 const ZEGO_SERVER_SECRET = import.meta.env.VITE_ZEGO_SERVER_SECRET || ''
 const ENABLE_WEB_PUSH = String(import.meta.env.VITE_ENABLE_WEB_PUSH || '1') !== '0'
+const MAX_REGISTER_PROFILE_SIZE = 5 * 1024 * 1024
 
 function urlBase64ToUint8Array(base64String) {
   const padding = '='.repeat((4 - (base64String.length % 4)) % 4)
@@ -28,11 +31,11 @@ function urlBase64ToUint8Array(base64String) {
 }
 
 function App({ portalRole = 'user' }) {
-  const [token, setToken] = useState(localStorage.getItem('chat_token') || '')
+  const [token, setToken] = useState(() => getAccessToken())
+  const [authReady, setAuthReady] = useState(() => Boolean(getAccessToken()))
   const [currentUser, setCurrentUser] = useState(null)
   const [users, setUsers] = useState([])
-  const [groups, setGroups] = useState([])
-  const [usersPage, setUsersPage] = useState(1)
+  const [usersCursor, setUsersCursor] = useState(null)
   const [usersHasMore, setUsersHasMore] = useState(true)
   const [loadingMoreSidebar, setLoadingMoreSidebar] = useState(false)
   const [messagesByUser, setMessagesByUser] = useState({})
@@ -40,6 +43,7 @@ function App({ portalRole = 'user' }) {
   const [directPaginationById, setDirectPaginationById] = useState({})
   const [activeConversation, setActiveConversation] = useState(null)
   const [searchQuery, setSearchQuery] = useState('')
+  const [debouncedSearchQuery, setDebouncedSearchQuery] = useState('')
   const [draftMessage, setDraftMessage] = useState('')
   const [contactIdentifier, setContactIdentifier] = useState('')
   const [addingContact, setAddingContact] = useState(false)
@@ -49,7 +53,6 @@ function App({ portalRole = 'user' }) {
   const [error, setError] = useState('')
   const [isMobileChatOpen, setIsMobileChatOpen] = useState(false)
   const [isProfileOpen, setIsProfileOpen] = useState(false)
-  const [profileMenuOpen, setProfileMenuOpen] = useState(false)
   const [confirmAction, setConfirmAction] = useState(null)
   const [uploadingMedia, setUploadingMedia] = useState(false)
   const [pendingMedia, setPendingMedia] = useState([])
@@ -59,6 +62,8 @@ function App({ portalRole = 'user' }) {
   const [outgoingCall, setOutgoingCall] = useState(null)
   const [activeCall, setActiveCall] = useState(null)
   const [permissionHelp, setPermissionHelp] = useState(null)
+  const [blockingUserId, setBlockingUserId] = useState(null)
+  const [blockedUserIds, setBlockedUserIds] = useState({})
 
   const [loginForm, setLoginForm] = useState({ identifier: '', password: '' })
   const [registerForm, setRegisterForm] = useState({
@@ -67,16 +72,41 @@ function App({ portalRole = 'user' }) {
     mobileNumber: '',
     dateOfBirth: '',
     password: '',
+    confirmPassword: '',
   })
 
   const socketRef = useRef(null)
   const messageListRef = useRef(null)
+  const activeConversationRef = useRef(null)
   const suppressAutoScrollRef = useRef(false)
   const seenRequestRef = useRef({})
   const serviceWorkerRegRef = useRef(null)
   const hasPushSubscribedRef = useRef(false)
 
+  useEffect(() => subscribeToAuth((nextToken) => setToken(nextToken)), [])
+
+  useEffect(() => {
+    let mounted = true
+    if (getAccessToken()) {
+      setAuthReady(true)
+      return () => {
+        mounted = false
+      }
+    }
+
+    refreshSession()
+      .catch(() => null)
+      .finally(() => {
+        if (mounted) setAuthReady(true)
+      })
+
+    return () => {
+      mounted = false
+    }
+  }, [])
+
   const {
+    primeAlertAudio,
     stopIncomingAlert,
     playIncomingAlert,
     stopOutgoingAlert,
@@ -92,8 +122,21 @@ function App({ portalRole = 'user' }) {
         : ''
   const activeChat = useMemo(() => {
     if (!activeConversation) return null
-    return users.find((u) => u.id === activeConversation.id) || null
-  }, [activeConversation, users])
+    const matched = users.find((u) => u.id === activeConversation.id)
+    if (matched) return matched
+    if (activeConversation.type === 'direct') {
+      return {
+        id: activeConversation.id,
+        username: `User #${activeConversation.id}`,
+        profileMediaUrl: '',
+        isOnline: false,
+        lastSeen: null,
+        isBlockedByMe: Boolean(blockedUserIds[String(activeConversation.id)]),
+        hasBlockedMe: false,
+      }
+    }
+    return null
+  }, [activeConversation, users, blockedUserIds])
 
   const activeMessages = useMemo(() => {
     if (!activeConversation) return []
@@ -105,6 +148,22 @@ function App({ portalRole = 'user' }) {
     return directPaginationById[String(activeConversation.id)] || { hasMore: false, loadingOlder: false }
   }, [activeConversation, directPaginationById])
 
+  const canExportConversation = useMemo(
+    () => Boolean(currentUser?.canDownloadConversations || currentUser?.role === 'admin' || currentUser?.role === 'model_admin'),
+    [currentUser],
+  )
+
+  useEffect(() => {
+    activeConversationRef.current = activeConversation
+  }, [activeConversation])
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setDebouncedSearchQuery(searchQuery.trim())
+    }, 260)
+    return () => window.clearTimeout(timer)
+  }, [searchQuery])
+
   const replaceTempWithServerMessage = (list, tempId, serverMessage) => {
     const hasServer = list.some((m) => m.id === serverMessage?.id)
     return list
@@ -113,6 +172,72 @@ function App({ portalRole = 'user' }) {
         return hasServer ? null : serverMessage
       })
       .filter(Boolean)
+  }
+
+  const normalizeReactions = (reactions) =>
+    Array.isArray(reactions)
+      ? reactions.map((reaction) => ({
+          ...(reaction || {}),
+          reactors: Array.isArray(reaction?.reactors) ? reaction.reactors : [],
+        }))
+      : []
+
+  const normalizeMediaMimeType = (mimeType) => {
+    const raw = String(mimeType || '').trim().toLowerCase()
+    if (!raw) return null
+    const base = raw.split(';')[0].trim()
+    if (!base) return null
+    if (base === 'audio/x-m4a') return 'audio/mp4'
+    if (base === 'audio/x-wav') return 'audio/wav'
+    return base
+  }
+
+  const normalizeMessage = (message) => ({
+    ...(message || {}),
+    reactions: normalizeReactions(message?.reactions),
+  })
+
+  const applyBlockStateToUsers = (targetUserId, nextBlockState = {}) => {
+    const normalizedTargetUserId = Number(targetUserId)
+    if (!Number.isInteger(normalizedTargetUserId)) return
+
+    setUsers((prev) =>
+      prev.map((user) =>
+        Number(user.id) === normalizedTargetUserId
+          ? {
+              ...user,
+              isBlockedByMe: Boolean(nextBlockState.isBlockedByMe),
+              hasBlockedMe: Boolean(nextBlockState.hasBlockedMe),
+            }
+          : user,
+      ),
+    )
+
+    setBlockedUserIds((prev) => {
+      const next = { ...prev }
+      if (nextBlockState.isBlockedByMe) next[String(normalizedTargetUserId)] = true
+      else delete next[String(normalizedTargetUserId)]
+      return next
+    })
+  }
+
+  const applyReactionUpdateToAllConversations = (messageId, reactions = []) => {
+    const normalizedMessageId = Number(messageId)
+    if (!Number.isInteger(normalizedMessageId)) return
+    const nextReactions = normalizeReactions(reactions)
+    setMessagesByUser((prev) => {
+      let changed = false
+      const next = {}
+      for (const [key, list] of Object.entries(prev || {})) {
+        const updatedList = (list || []).map((message) => {
+          if (Number(message?.id) !== normalizedMessageId) return message
+          changed = true
+          return { ...message, reactions: nextReactions }
+        })
+        next[key] = updatedList
+      }
+      return changed ? next : prev
+    })
   }
 
   const clearPendingMedia = () => {
@@ -149,57 +274,75 @@ function App({ portalRole = 'user' }) {
     return Array.from(map.values())
   }
 
-  const closePermissionHelp = () => setPermissionHelp(null)
-  const retryPermissionCheck = async () => {
-    if (!permissionHelp) return
-    const ok = await ensureCallDevicePermission(permissionHelp.callType || 'video')
-    if (ok) setPermissionHelp(null)
+  const getSidebarUserSortTime = (user, messageState = messagesByUser) => {
+    const list = messageState[String(user?.id)] || []
+    const lastLoadedMessage = list[list.length - 1]
+    const candidates = [lastLoadedMessage?.createdAt, user?.lastMessageAt, user?.updatedAt, user?.createdAt]
+    for (const value of candidates) {
+      const ts = new Date(value || '').getTime()
+      if (Number.isFinite(ts) && ts > 0) return ts
+    }
+    return 0
   }
 
-  const ensureCallDevicePermission = async (type = 'video') => {
-    const needCamera = type !== 'audio'
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setPermissionHelp({
-        callType: type,
-        title: 'This browser does not support calling',
-        message: 'Your browser does not support microphone/camera access.',
-      })
-      return false
+  const trimSidebarUsers = (list = [], options = {}) => {
+    const max = Number(options.max) > 0 ? Number(options.max) : MAX_LOADED_SIDEBAR_USERS
+    if (!Array.isArray(list) || list.length <= max) return Array.isArray(list) ? list : []
+
+    const activeId = Number(options.activeId ?? activeConversationRef.current?.id)
+    const pinnedIds = new Set()
+    if (Number.isInteger(activeId) && activeId > 0) pinnedIds.add(activeId)
+
+    const sorted = [...list].sort((a, b) => {
+      const unreadDiff = (Number(b?.unreadCount) || 0) - (Number(a?.unreadCount) || 0)
+      if (unreadDiff !== 0) return unreadDiff
+      const onlineDiff = Number(Boolean(b?.isOnline)) - Number(Boolean(a?.isOnline))
+      if (onlineDiff !== 0) return onlineDiff
+      const timeDiff = getSidebarUserSortTime(b) - getSidebarUserSortTime(a)
+      if (timeDiff !== 0) return timeDiff
+      return String(a?.username || '').localeCompare(String(b?.username || ''))
+    })
+
+    for (const item of sorted) {
+      if (pinnedIds.size >= MAX_PINNED_SIDEBAR_USERS) break
+      if ((Number(item?.unreadCount) || 0) > 0 || item?.isOnline) pinnedIds.add(Number(item.id))
     }
 
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: needCamera,
-      })
-      stream.getTracks().forEach((track) => track.stop())
-      return true
-    } catch (error) {
-      const errName = String(error?.name || '').toLowerCase()
-      const blocked = errName.includes('notallowed') || errName.includes('permission')
-      const missing = errName.includes('notfound') || errName.includes('overconstrained')
-      const title = blocked
-        ? `${needCamera ? 'Camera + microphone' : 'Microphone'} permission is blocked`
-        : missing
-          ? `${needCamera ? 'Camera or microphone' : 'Microphone'} not found`
-          : `Cannot access ${needCamera ? 'camera/microphone' : 'microphone'}`
-
-      setPermissionHelp({
-        callType: type,
-        title,
-        message: blocked
-          ? `Please allow ${needCamera ? 'camera and microphone' : 'microphone'} in browser site settings, then try again.`
-          : 'Please check device availability and browser permissions, then try again.',
-      })
-      return false
+    const pinned = []
+    const rest = []
+    for (const item of sorted) {
+      if (pinnedIds.has(Number(item?.id))) pinned.push(item)
+      else rest.push(item)
     }
+
+    return [...pinned, ...rest].slice(0, max)
+  }
+
+  const matchesSidebarQuery = (user, query = debouncedSearchQuery) => {
+    const q = String(query || '').trim().toLowerCase()
+    if (!q) return true
+    return (
+      String(user?.username || '').toLowerCase().includes(q) ||
+      String(user?.uniqueUsername || '').toLowerCase().includes(q) ||
+      String(user?.email || '').toLowerCase().includes(q) ||
+      String(user?.mobileNumber || '').toLowerCase().includes(q)
+    )
+  }
+
+  const closePermissionHelp = () => setPermissionHelp(null)
+  const retryPermissionCheck = () => {
+    setPermissionHelp(null)
   }
 
   const ensureServiceWorker = async () => {
     if (!ENABLE_WEB_PUSH) return null
     if (!('serviceWorker' in navigator)) return null
-    if (serviceWorkerRegRef.current) return serviceWorkerRegRef.current
-    const reg = await navigator.serviceWorker.register('/sw.js')
+    if (serviceWorkerRegRef.current) {
+      serviceWorkerRegRef.current.update().catch(() => null)
+      return serviceWorkerRegRef.current
+    }
+    const reg = await navigator.serviceWorker.register('/sw.js?v=20260320-1')
+    reg.update().catch(() => null)
     serviceWorkerRegRef.current = reg
     return reg
   }
@@ -242,45 +385,61 @@ function App({ portalRole = 'user' }) {
     hasPushSubscribedRef.current = true
   }
 
-  const clearAuthSession = (message = 'Session expired. Please login again.') => {
+  const resetAuthUi = (message = 'Session expired. Please login again.') => {
     stopIncomingAlert()
     stopOutgoingAlert()
     socketRef.current?.disconnect()
     socketRef.current = null
-    localStorage.removeItem('chat_token')
-    setToken('')
     setCurrentUser(null)
     setUsers([])
-    setGroups([])
-    setUsersPage(1)
+    setUsersCursor(null)
     setUsersHasMore(true)
     setMessagesByUser({})
     setDirectPaginationById({})
     setActiveConversation(null)
+    setBlockedUserIds({})
     setError(message)
     setIncomingCall(null)
     setOutgoingCall(null)
     setActiveCall(null)
   }
 
-  const apiFetch = async (path, options = {}, authToken = token) => {
-    const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData
-    const res = await fetch(`${API_URL}${path}`, {
-      ...options,
-      headers: {
-        ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
-        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
-        ...(options.headers || {}),
-      },
-    })
-    const data = await res.json().catch(() => ({}))
-    if (!res.ok) {
-      if (res.status === 401 && authToken) clearAuthSession(data.message || 'Unauthorized')
-      const baseMessage = data.message || 'Request failed'
-      const details = data.error && data.error !== baseMessage ? `: ${data.error}` : ''
-      throw new Error(`${baseMessage}${details}`)
+  const clearAuthSession = async (message = 'Session expired. Please login again.', options = {}) => {
+    const shouldNotifyServer = Boolean(options.notifyServer)
+    if (shouldNotifyServer) {
+      await logoutSession()
+    } else {
+      clearAccessToken()
     }
-    return data
+    resetAuthUi(message)
+  }
+
+  useEffect(() => {
+    if (!authReady || token) return
+    const hasSessionState =
+      Boolean(currentUser) ||
+      users.length > 0 ||
+      Object.keys(messagesByUser).length > 0 ||
+      Object.keys(directPaginationById).length > 0 ||
+      Boolean(socketRef.current)
+    if (hasSessionState) {
+      resetAuthUi('')
+    }
+  }, [authReady, token, currentUser, users.length, messagesByUser, directPaginationById])
+
+  const apiFetch = async (path, options = {}, authToken = token) => {
+    try {
+      return await fetchJsonWithAuth(path, options, {
+        tokenOverride: authToken,
+        skipAuth: !authToken && /^\/api\/auth\/(login|register)$/i.test(String(path || '')),
+        allowRefresh: !/^\/api\/auth\/(login|register|refresh|logout)$/i.test(String(path || '')),
+      })
+    } catch (error) {
+      if (error?.code === 'AUTH_UNAUTHORIZED') {
+        resetAuthUi('Session expired. Please login again.')
+      }
+      throw error
+    }
   }
 
   const normalizeUploadUrl = (value) => {
@@ -289,7 +448,7 @@ function App({ portalRole = 'user' }) {
     if (!trimmed) return ''
     if (/^https?:\/\//i.test(trimmed)) return trimmed
     if (trimmed.startsWith('/')) return `${UPLOAD_SERVER_URL}${trimmed}`
-    if (trimmed.startsWith('uploads/')) return `${UPLOAD_SERVER_URL}/${trimmed}`
+    if (trimmed.startsWith('public/')) return `${UPLOAD_SERVER_URL}/${trimmed}`
     return ''
   }
 
@@ -333,12 +492,29 @@ function App({ portalRole = 'user' }) {
   }
 
   const fetchContacts = async (authToken = token, options = {}) => {
-    const page = Number(options.page) > 0 ? Number(options.page) : 1
     const append = Boolean(options.append)
-    const data = await apiFetch(`/api/users?page=${page}&limit=${CHAT_LIST_PAGE_SIZE}`, {}, authToken)
+    const currentQuery = String(options.query ?? debouncedSearchQuery).trim()
+    const params = new URLSearchParams({
+      limit: String(CHAT_LIST_PAGE_SIZE),
+    })
+    if (append && options.cursor?.cursorTime && options.cursor?.cursorId) {
+      params.set('cursorTime', String(options.cursor.cursorTime))
+      params.set('cursorId', String(options.cursor.cursorId))
+    }
+    if (currentQuery) params.set('q', currentQuery)
+    const data = await apiFetch(`/api/users?${params.toString()}`, {}, authToken)
     const incoming = data.users || []
-    setUsers((prev) => (append ? mergeUniqueById(prev, incoming) : incoming))
-    setUsersPage(page)
+    setBlockedUserIds((prev) => {
+      const next = append ? { ...prev } : {}
+      incoming.forEach((user) => {
+        if (!user?.id) return
+        if (user.isBlockedByMe) next[String(user.id)] = true
+        else delete next[String(user.id)]
+      })
+      return next
+    })
+    setUsers((prev) => trimSidebarUsers(append ? mergeUniqueById(prev, incoming) : incoming))
+    setUsersCursor(data.nextCursor || null)
     setUsersHasMore(Boolean(data.hasMore))
     return incoming
   }
@@ -357,7 +533,7 @@ function App({ portalRole = 'user' }) {
     const params = new URLSearchParams({ limit: String(MESSAGE_PAGE_SIZE) })
     if (beforeId) params.set('beforeId', String(beforeId))
     const data = await apiFetch(`/api/messages/${id}?${params.toString()}`, {}, authToken)
-    const incoming = data.messages || []
+    const incoming = (data.messages || []).map(normalizeMessage)
 
     setMessagesByUser((prev) => {
       const key = String(id)
@@ -381,6 +557,7 @@ function App({ portalRole = 'user' }) {
       [String(id)]: {
         note: String(data.conversationNote || ''),
         assignedToUserId: data.conversationAssignedToUserId || null,
+        canEditNote: Boolean(data.canEditConversationNote),
       },
     }))
     return incoming.length > 0
@@ -391,7 +568,6 @@ function App({ portalRole = 'user' }) {
     setActiveConversation(conversation)
     setIsMobileChatOpen(true)
     setIsProfileOpen(false)
-    setProfileMenuOpen(false)
     if (typeof window !== 'undefined' && window.matchMedia('(max-width: 767px)').matches) {
       window.history.pushState({ mobileChatOpen: true, conversation }, '')
     }
@@ -436,7 +612,7 @@ function App({ portalRole = 'user' }) {
     if (!usersHasMore) return
     setLoadingMoreSidebar(true)
     try {
-      if (usersHasMore) await fetchContacts(token, { page: usersPage + 1, append: true })
+      if (usersHasMore) await fetchContacts(token, { append: true, query: debouncedSearchQuery, cursor: usersCursor })
     } catch (err) {
       setError(err.message)
     } finally {
@@ -510,6 +686,25 @@ function App({ portalRole = 'user' }) {
   }, [outgoingCall])
 
   useEffect(() => {
+    let primed = false
+    const runPrime = () => {
+      if (primed) return
+      primed = true
+      primeAlertAudio()
+    }
+
+    window.addEventListener('pointerdown', runPrime, { passive: true })
+    window.addEventListener('touchstart', runPrime, { passive: true })
+    window.addEventListener('keydown', runPrime)
+
+    return () => {
+      window.removeEventListener('pointerdown', runPrime)
+      window.removeEventListener('touchstart', runPrime)
+      window.removeEventListener('keydown', runPrime)
+    }
+  }, [primeAlertAudio])
+
+  useEffect(() => {
     if (!incomingCall) {
       stopIncomingAlert()
       return
@@ -530,9 +725,25 @@ function App({ portalRole = 'user' }) {
   }, [incomingCall])
 
   useEffect(() => {
+    if (!incomingCall) return undefined
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        primeAlertAudio()
+        playIncomingAlert()
+      }
+    }
+
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+    }
+  }, [incomingCall, playIncomingAlert, primeAlertAudio])
+
+  useEffect(() => {
     if (!token) return
-    let mounted = true
-    ;(async () => {
+    let mounted = true;
+    (async () => {
       setLoadingApp(true)
       setError('')
       try {
@@ -540,7 +751,7 @@ function App({ portalRole = 'user' }) {
         if (!mounted) return
         setCurrentUser(me.user)
         ensurePushSubscription(token).catch(() => null)
-        const fetchedUsers = await fetchContacts(token, { page: 1, append: false })
+        const fetchedUsers = await fetchContacts(token, { append: false, query: '' })
         if (!mounted) return
         if (fetchedUsers[0]) {
           setActiveConversation({ type: 'direct', id: fetchedUsers[0].id })
@@ -549,7 +760,8 @@ function App({ portalRole = 'user' }) {
         }
 
         const socket = io(SOCKET_URL, { auth: { token }, transports: ['websocket'] })
-        socket.on('chat:message', (message) => {
+        socket.on('chat:message', (rawMessage) => {
+          const message = normalizeMessage(rawMessage)
           const otherId = Number(message.senderId) === Number(me.user.id) ? message.receiverId : message.senderId
           const isFromMe = Number(message.senderId) === Number(me.user.id)
           setMessagesByUser((prev) => {
@@ -558,17 +770,39 @@ function App({ portalRole = 'user' }) {
             if (list.some((m) => m.id === message.id)) return prev
             return { ...prev, [key]: [...list, message] }
           })
-          setUsers((prev) =>
-            prev.map((u) => {
-              if (u.id !== otherId) return u
-              const shouldIncreaseUnread = !isFromMe && !(activeConversation?.type === 'direct' && Number(activeConversation.id) === Number(otherId))
-              return {
-                ...u,
-                lastMessageAt: message.createdAt || new Date().toISOString(),
-                unreadCount: shouldIncreaseUnread ? (Number(u.unreadCount) || 0) + 1 : Number(u.unreadCount) || 0,
-              }
-            }),
-          )
+          setUsers((prev) => {
+            const shouldIncreaseUnread = !isFromMe && !(activeConversation?.type === 'direct' && Number(activeConversation.id) === Number(otherId))
+            const existing = prev.find((u) => Number(u.id) === Number(otherId))
+            const nextList = existing
+              ? prev.map((u) => {
+                  if (Number(u.id) !== Number(otherId)) return u
+                  return {
+                    ...u,
+                    lastMessageAt: message.createdAt || new Date().toISOString(),
+                    unreadCount: shouldIncreaseUnread ? (Number(u.unreadCount) || 0) + 1 : Number(u.unreadCount) || 0,
+                  }
+                })
+              : matchesSidebarQuery(message?.sender || { username: message?.sender?.username || `User #${otherId}` })
+                ? [
+                  {
+                    id: otherId,
+                    username: String(message?.sender?.username || activeConversationRef.current?.username || `User #${otherId}`),
+                    uniqueUsername: String(message?.sender?.uniqueUsername || ''),
+                    role: String(message?.sender?.role || 'user'),
+                    canHandleExternalChat: Boolean(message?.sender?.canHandleExternalChat),
+                    profileMediaUrl: message?.sender?.profileMediaUrl || null,
+                    lastSeen: null,
+                    lastMessageAt: message.createdAt || new Date().toISOString(),
+                    unreadCount: shouldIncreaseUnread ? 1 : 0,
+                    isOnline: false,
+                    isBlockedByMe: false,
+                    hasBlockedMe: false,
+                  },
+                  ...prev,
+                ]
+                : prev
+            return trimSidebarUsers(nextList)
+          })
         })
         socket.on('chat:presence', (payload) => {
           setUsers((prev) => prev.map((u) => (u.id === payload.userId ? { ...u, isOnline: payload.isOnline, lastSeen: payload.lastSeen } : u)))
@@ -588,14 +822,99 @@ function App({ portalRole = 'user' }) {
         })
         socket.on('chat:assignment-updated', async () => {
           try {
-            const updatedUsers = await fetchContacts(token, { page: 1, append: false })
-            if (!updatedUsers.some((u) => Number(u.id) === Number(activeConversation?.id))) {
-              setActiveConversation((prev) => (prev?.type === 'direct' ? null : prev))
-              setIsMobileChatOpen(false)
-            }
+            await fetchContacts(token, { append: false })
           } catch {
             // ignore refresh errors for realtime sync helper
           }
+        })
+        socket.on('chat:reaction-updated', (payload) => {
+          applyReactionUpdateToAllConversations(payload?.messageId, payload?.reactions || [])
+        })
+        socket.on('chat:conversation-note-updated', (payload) => {
+          const withUserId = Number(payload?.withUserId)
+          if (!Number.isInteger(withUserId)) return
+          setConversationMetaByUser((prev) => ({
+            ...prev,
+            [String(withUserId)]: {
+              ...(prev[String(withUserId)] || {}),
+              note: String(payload?.conversationNote || ''),
+              assignedToUserId: payload?.conversationAssignedToUserId || null,
+              canEditNote: true,
+            },
+          }))
+        })
+        socket.on('chat:note-access-updated', async (payload) => {
+          const enabled = Boolean(payload?.enabled)
+          setCurrentUser((prev) => (prev ? { ...prev, canEditConversationNote: enabled, profileNote: enabled ? prev.profileNote || '' : '' } : prev))
+          setConversationMetaByUser((prev) => {
+            const next = {}
+            for (const [key, meta] of Object.entries(prev || {})) {
+              next[key] = enabled
+                ? { ...(meta || {}), canEditNote: true }
+                : { ...(meta || {}), canEditNote: false, note: '', assignedToUserId: null }
+            }
+            return next
+          })
+
+          if (!enabled) return
+          try {
+            const meData = await apiFetch('/api/auth/me', {}, token)
+            setCurrentUser((prev) => (prev ? { ...prev, ...(meData.user || {}) } : meData.user || prev))
+          } catch {
+            // ignore realtime refresh errors
+          }
+          const current = activeConversationRef.current
+          if (!current || current.type !== 'direct' || !current.id) return
+          try {
+            await loadDirectConversation(current.id, token)
+          } catch {
+            // ignore realtime refresh errors
+          }
+        })
+        socket.on('chat:profile-note-updated', (payload) => {
+          setCurrentUser((prev) => (prev ? { ...prev, profileNote: String(payload?.profileNote || '') } : prev))
+        })
+        socket.on('chat:download-access-updated', (payload) => {
+          const enabled = Boolean(payload?.enabled)
+          setCurrentUser((prev) => (prev ? { ...prev, canDownloadConversations: enabled } : prev))
+        })
+        socket.on('chat:contact-added', ({ user }) => {
+          if (!user?.id) return
+          setUsers((prev) => {
+            if (!matchesSidebarQuery(user)) return prev
+            const existing = prev.find((item) => Number(item.id) === Number(user.id))
+            const nextUser = {
+              ...user,
+              isBlockedByMe: Boolean(user?.isBlockedByMe ?? existing?.isBlockedByMe),
+              hasBlockedMe: Boolean(user?.hasBlockedMe ?? existing?.hasBlockedMe),
+            }
+            return trimSidebarUsers(mergeUniqueById(prev, [nextUser]))
+          })
+        })
+        socket.on('chat:block-status-updated', (payload) => {
+          const targetUserId = Number(payload?.userId)
+          if (!Number.isInteger(targetUserId)) return
+          applyBlockStateToUsers(targetUserId, {
+            isBlockedByMe: Boolean(payload?.isBlockedByMe),
+            hasBlockedMe: Boolean(payload?.hasBlockedMe),
+          })
+        })
+        socket.on('chat:contact-removed', ({ userId: removedUserId }) => {
+          const removedId = Number(removedUserId)
+          if (!Number.isInteger(removedId)) return
+          setUsers((prev) => prev.filter((u) => Number(u.id) !== removedId))
+          setMessagesByUser((prev) => {
+            const next = { ...prev }
+            delete next[String(removedId)]
+            return next
+          })
+          setDirectPaginationById((prev) => {
+            const next = { ...prev }
+            delete next[String(removedId)]
+            return next
+          })
+          setActiveConversation((prev) => (Number(prev?.id) === removedId ? null : prev))
+          fetchContacts(token, { append: false }).catch(() => null)
         })
         socket.on('call:incoming', (payload) => {
           setIncomingCall(payload)
@@ -686,6 +1005,13 @@ function App({ portalRole = 'user' }) {
   }, [token])
 
   useEffect(() => {
+    if (!token) return
+    fetchContacts(token, { append: false, query: debouncedSearchQuery }).catch((err) => {
+      setError(err.message)
+    })
+  }, [token, debouncedSearchQuery])
+
+  useEffect(() => {
     if (!token || !ENABLE_WEB_PUSH) return
     ensureServiceWorker().catch(() => null)
   }, [token])
@@ -698,10 +1024,7 @@ function App({ portalRole = 'user' }) {
   }, [activeMessages.length, activeConversation?.id, activeConversationType])
 
   const filteredUsers = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase()
-    const filtered = !q
-      ? [...users]
-      : users.filter((u) => u.username.toLowerCase().includes(q) || (u.email || '').toLowerCase().includes(q) || (u.mobileNumber || '').toLowerCase().includes(q))
+    const filtered = [...users]
 
     const getUserSortTime = (user) => {
       const list = messagesByUser[String(user.id)] || []
@@ -721,7 +1044,7 @@ function App({ portalRole = 'user' }) {
     })
 
     return filtered
-  }, [users, searchQuery, messagesByUser])
+  }, [users, messagesByUser])
 
   const getInitials = (name = '') => name.split(' ').map((p) => p[0]).join('').slice(0, 2).toUpperCase()
   const formatTime = (value) => (value ? new Date(value).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '')
@@ -740,16 +1063,26 @@ function App({ portalRole = 'user' }) {
   }
   const onLogin = async (e) => {
     e.preventDefault()
+    const identifier = String(loginForm.identifier || '').trim()
+    const password = String(loginForm.password || '')
+    if (!identifier) {
+      setError('Username, email, or mobile is required')
+      return
+    }
+    if (!password) {
+      setError('Password is required')
+      return
+    }
     setSubmitting(true)
     setError('')
     try {
       const payload = {
         ...loginForm,
-        identifier: String(loginForm.identifier || '').trim(),
+        identifier,
       }
       const data = await apiFetch('/api/auth/login', { method: 'POST', body: JSON.stringify(payload) }, '')
-      localStorage.setItem('chat_token', data.token)
-      setToken(data.token)
+      setAccessToken(data.token)
+      setAuthReady(true)
       setLoginForm({ identifier: '', password: '' })
     } catch (err) {
       setError(err.message)
@@ -760,29 +1093,106 @@ function App({ portalRole = 'user' }) {
 
   const onRegister = async (e) => {
     e.preventDefault()
+    const username = String(registerForm.username || '').trim()
+    const email = String(registerForm.email || '').trim()
+    const mobileNumber = String(registerForm.mobileNumber || '').trim()
+    const dateOfBirth = String(registerForm.dateOfBirth || '').trim()
+    const password = String(registerForm.password || '')
+    const confirmPassword = String(registerForm.confirmPassword || '')
+    if (username.length < 3) {
+      setError('Username must be at least 3 characters')
+      return
+    }
+    if (!email && !mobileNumber) {
+      setError('Email or mobile number is required')
+      return
+    }
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      setError('Please enter a valid email address')
+      return
+    }
+    if (mobileNumber && !/^[0-9+\-\s]{3,20}$/.test(mobileNumber)) {
+      setError('Please enter a valid mobile number')
+      return
+    }
+    if (!dateOfBirth) {
+      setError('Date of birth is required')
+      return
+    }
+    const dob = new Date(`${dateOfBirth}T00:00:00`)
+    if (Number.isNaN(dob.getTime())) {
+      setError('Please enter a valid date of birth')
+      return
+    }
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
+    if (dob > today) {
+      setError('Date of birth cannot be in the future')
+      return
+    }
+    const maxAgeDate = new Date(today)
+    maxAgeDate.setFullYear(today.getFullYear() - 120)
+    if (dob < maxAgeDate) {
+      setError('Age cannot be more than 120 years')
+      return
+    }
+    const minAgeDate = new Date(today)
+    minAgeDate.setFullYear(today.getFullYear() - 13)
+    if (dob > minAgeDate) {
+      setError('You must be at least 13 years old')
+      return
+    }
+    if (password.length < 6) {
+      setError('Password must be at least 6 characters')
+      return
+    }
+    if (password !== confirmPassword) {
+      setError('Passwords do not match')
+      return
+    }
     setSubmitting(true)
     setError('')
     let rollbackToken = ''
-    let rollbackRequested = false
+    let rollbackAttempted = false
+    let rollbackSucceeded = false
+    let rollbackFailureReason = ''
     try {
-      const payload = { ...registerForm, email: registerForm.email || undefined, mobileNumber: registerForm.mobileNumber || undefined }
+      const payload = {
+        username,
+        email: email || undefined,
+        mobileNumber: mobileNumber || undefined,
+        dateOfBirth,
+        password,
+      }
       const data = await apiFetch('/api/auth/register', { method: 'POST', body: JSON.stringify(payload) }, '')
       rollbackToken = data?.token || ''
       if (registerProfileFile) {
+        if (registerProfileFile.size > MAX_REGISTER_PROFILE_SIZE) {
+          throw new Error('Profile image must be 5MB or less.')
+        }
         const uniqueUsername = data?.user?.uniqueUsername || data?.user?.username
         const profileMediaUrl = await uploadToExternalServer(registerProfileFile, 'profile', uniqueUsername)
         await apiFetch('/api/users/profile-media', { method: 'POST', body: JSON.stringify({ profileMediaUrl }) }, data.token)
       }
-      localStorage.setItem('chat_token', data.token)
-      setToken(data.token)
-      setRegisterForm({ username: '', email: '', mobileNumber: '', dateOfBirth: '', password: '' })
+      setAccessToken(data.token)
+      setAuthReady(true)
+      setRegisterForm({ username: '', email: '', mobileNumber: '', dateOfBirth: '', password: '', confirmPassword: '' })
       setRegisterProfileFile(null)
     } catch (err) {
       if (rollbackToken) {
-        rollbackRequested = true
-        await apiFetch('/api/auth/rollback-registration', { method: 'POST' }, rollbackToken).catch(() => null)
+        rollbackAttempted = true
+        try {
+          await apiFetch('/api/auth/rollback-registration', { method: 'POST' }, rollbackToken)
+          rollbackSucceeded = true
+        } catch (rollbackError) {
+          rollbackFailureReason = rollbackError.message
+        }
       }
-      const rollbackNote = rollbackRequested ? ' Registration data was rolled back. Please try again.' : ''
+      const rollbackNote = rollbackSucceeded
+        ? ' Registration data was rolled back. Please try again.'
+        : rollbackAttempted
+          ? ` Rollback failed: ${rollbackFailureReason || 'unknown reason'}. Please retry registration rollback.`
+          : ''
       setError(`${err.message}${rollbackNote}`)
     } finally {
       setSubmitting(false)
@@ -797,7 +1207,7 @@ function App({ portalRole = 'user' }) {
     setError('')
     try {
       const data = await apiFetch('/api/users/contacts', { method: 'POST', body: JSON.stringify({ identifier }) })
-      const contacts = await fetchContacts(token, { page: 1, append: false })
+      const contacts = await fetchContacts(token, { append: false })
       if (data.contact?.id && contacts.some((c) => c.id === data.contact.id)) {
         await openConversation({ type: 'direct', id: data.contact.id })
       }
@@ -816,6 +1226,10 @@ function App({ portalRole = 'user' }) {
   const sendMessage = async () => {
     const text = draftMessage.trim()
     if (!text || !activeConversation || !currentUser) return
+    if (activeChat?.hasBlockedMe || activeChat?.isBlockedByMe) {
+      setError('You can no longer message each other')
+      return
+    }
     const tempId = `temp-${Date.now()}`
     const temp = {
       id: tempId,
@@ -842,7 +1256,7 @@ function App({ portalRole = 'user' }) {
         setMessagesByUser((prev) => {
           const key = String(activeConversation.id)
           const list = prev[key] || []
-          return { ...prev, [key]: replaceTempWithServerMessage(list, tempId, ack.message) }
+          return { ...prev, [key]: replaceTempWithServerMessage(list, tempId, normalizeMessage(ack.message)) }
         })
       })
       return
@@ -852,15 +1266,41 @@ function App({ portalRole = 'user' }) {
       setMessagesByUser((prev) => {
         const key = String(activeConversation.id)
         const list = prev[key] || []
-        return { ...prev, [key]: replaceTempWithServerMessage(list, tempId, data.message) }
+        return { ...prev, [key]: replaceTempWithServerMessage(list, tempId, normalizeMessage(data.message)) }
       })
     } catch (err) {
       setError(err.message)
     }
   }
 
+  const saveActiveConversationNote = async (note) => {
+    if (!activeConversation || activeConversation.type !== 'direct') return false
+    try {
+      const data = await apiFetch(`/api/messages/${activeConversation.id}/note`, {
+        method: 'PATCH',
+        body: JSON.stringify({ note: String(note || '') }),
+      })
+      setConversationMetaByUser((prev) => ({
+        ...prev,
+        [String(activeConversation.id)]: {
+          ...(prev[String(activeConversation.id)] || {}),
+          note: String(data.conversationNote || ''),
+          canEditNote: true,
+        },
+      }))
+      return true
+    } catch (err) {
+      setError(err.message)
+      return false
+    }
+  }
+
   const sendMedia = async (file, options = {}) => {
     if (!file || !activeConversation) return
+    if (activeChat?.hasBlockedMe || activeChat?.isBlockedByMe) {
+      setError('You can no longer message each other')
+      return
+    }
     const isImage = file.type.startsWith('image/')
     const isVideo = file.type.startsWith('video/')
     const isAudio = file.type.startsWith('audio/')
@@ -875,7 +1315,7 @@ function App({ portalRole = 'user' }) {
           mediaUrl,
           messageType,
           mediaGroupId: options.mediaGroupId || null,
-          mediaMimeType: file.type || null,
+          mediaMimeType: normalizeMediaMimeType(file.type),
           mediaOriginalName: file.name || null,
           mediaDurationSec: messageType === 'audio' ? Math.floor(Number(options.mediaDurationSec || 0)) : null,
           text: '',
@@ -885,7 +1325,7 @@ function App({ portalRole = 'user' }) {
         const key = String(activeConversation.id)
         const list = prev[key] || []
         if (list.some((m) => m.id === data.message?.id)) return prev
-        return { ...prev, [key]: [...list, data.message] }
+        return { ...prev, [key]: [...list, normalizeMessage(data.message)] }
       })
       setUsers((prev) =>
         prev.map((u) => (u.id === activeConversation.id ? { ...u, lastMessageAt: data.message?.createdAt || new Date().toISOString() } : u)),
@@ -899,9 +1339,11 @@ function App({ portalRole = 'user' }) {
 
   const createMediaGroupId = () => `mg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
 
+  const MAX_MEDIA_BATCH_SIZE = 30
+
   const sendMediaBatch = async (files) => {
     if (!Array.isArray(files) || files.length === 0) return
-    const picked = files.slice(0, 10)
+    const picked = files.slice(0, MAX_MEDIA_BATCH_SIZE)
     const canGroup = picked.every((file) => file?.type?.startsWith('image/') || file?.type?.startsWith('video/'))
     const mediaGroupId = canGroup && picked.length > 1 ? createMediaGroupId() : null
 
@@ -918,7 +1360,7 @@ function App({ portalRole = 'user' }) {
 
   const pickMediaFiles = async (files) => {
     if (!Array.isArray(files) || files.length === 0 || !activeConversation) return
-    const picked = files.slice(0, 10)
+    const picked = files.slice(0, MAX_MEDIA_BATCH_SIZE)
     const allVisual = picked.every((file) => file?.type?.startsWith('image/') || file?.type?.startsWith('video/'))
 
     if (!allVisual) {
@@ -927,7 +1369,7 @@ function App({ portalRole = 'user' }) {
     }
 
     setPendingMedia((prev) => {
-      const remain = Math.max(0, 10 - prev.length)
+      const remain = Math.max(0, MAX_MEDIA_BATCH_SIZE - prev.length)
       const nextFiles = picked.slice(0, remain)
       const nextItems = nextFiles.map((file) => ({
         id: `pm-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -995,43 +1437,129 @@ function App({ portalRole = 'user' }) {
     })
   }
 
-  const clearChat = async () => {
+  const exportConversationPdf = async () => {
     if (!activeConversation || activeConversation.type !== 'direct') return
-    await apiFetch(`/api/messages/chat/${activeConversation.id}`, { method: 'DELETE' })
-    setMessagesByUser((prev) => ({ ...prev, [String(activeConversation.id)]: [] }))
+    if (!canExportConversation) return
+    try {
+      const res = await fetchWithAuth(`/api/messages/${activeConversation.id}/export-pdf`)
+      if (!res.ok) {
+        const payload = await res.json().catch(() => ({}))
+        if (payload?.fallbackFormat === 'txt') {
+          const fallbackRes = await fetchWithAuth(`/api/messages/${activeConversation.id}/export-txt`)
+          if (!fallbackRes.ok) {
+            const fallbackPayload = await fallbackRes.json().catch(() => ({}))
+            throw new Error(fallbackPayload.message || 'Failed to export conversation TXT')
+          }
+          const fallbackBlob = await fallbackRes.blob()
+          const fallbackUrl = URL.createObjectURL(fallbackBlob)
+          const fallbackFilename = (() => {
+            const raw = fallbackRes.headers.get('content-disposition') || ''
+            const match = raw.match(/filename=\"?([^\";]+)\"?/)
+            return match?.[1] || `conversation_${activeConversation.id}.txt`
+          })()
+          const fallbackLink = document.createElement('a')
+          fallbackLink.href = fallbackUrl
+          fallbackLink.download = fallbackFilename
+          document.body.appendChild(fallbackLink)
+          fallbackLink.click()
+          fallbackLink.remove()
+          setTimeout(() => URL.revokeObjectURL(fallbackUrl), 1000)
+          setError(payload.message || 'Conversation was exported as TXT because it is too large for PDF.')
+          return
+        }
+        throw new Error(payload.message || 'Failed to export conversation PDF')
+      }
+      const contentType = String(res.headers.get('content-type') || '').toLowerCase()
+      if (!contentType.includes('application/pdf')) {
+        throw new Error('PDF export is not active yet. Please restart the backend server and try again.')
+      }
+      const blob = await res.blob()
+      const objectUrl = URL.createObjectURL(blob)
+      const filenameFromHeader = (() => {
+        const raw = res.headers.get('content-disposition') || ''
+        const match = raw.match(/filename=\"?([^\";]+)\"?/)
+        return match?.[1] || `conversation_${activeConversation.id}.pdf`
+      })()
+      const link = document.createElement('a')
+      link.href = objectUrl
+      link.download = filenameFromHeader
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 1000)
+    } catch (err) {
+      setError(err.message)
+    }
   }
 
-  const deleteChat = async () => {
-    if (!activeConversation || activeConversation.type !== 'direct') return
-    await apiFetch(`/api/messages/chat/${activeConversation.id}`, { method: 'DELETE' })
-    await apiFetch(`/api/users/contacts/${activeConversation.id}`, { method: 'DELETE' })
-    setUsers((prev) => prev.filter((u) => u.id !== activeConversation.id))
-    setMessagesByUser((prev) => {
-      const next = { ...prev }
-      delete next[String(activeConversation.id)]
-      return next
+  const updateOwnProfileNote = async (profileNote) => {
+    const data = await apiFetch('/api/users/profile-note', {
+      method: 'PATCH',
+      body: JSON.stringify({ profileNote: String(profileNote || '') }),
     })
-    setActiveConversation(null)
+    setCurrentUser((prev) => ({ ...prev, ...(data.user || {}), profileNote: data?.user?.profileNote || '' }))
+    return data.user || null
+  }
+
+  const toggleBlockUser = async (chatUser) => {
+    const targetId = Number(chatUser?.id)
+    if (!Number.isInteger(targetId)) return
+    setBlockingUserId(targetId)
+    try {
+      const isBlocked = Boolean(blockedUserIds[String(targetId)] || chatUser?.isBlockedByMe)
+      if (isBlocked) {
+        await apiFetch(`/api/users/${targetId}/block`, { method: 'DELETE' })
+        applyBlockStateToUsers(targetId, { isBlockedByMe: false, hasBlockedMe: false })
+      } else {
+        await apiFetch(`/api/users/${targetId}/block`, { method: 'POST' })
+        applyBlockStateToUsers(targetId, { isBlockedByMe: true, hasBlockedMe: false })
+      }
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBlockingUserId(null)
+    }
+  }
+
+  const refreshCurrentUser = async (authToken = token) => {
+    if (!authToken) return null
+    const data = await apiFetch('/api/auth/me', {}, authToken)
+    setCurrentUser(data.user || null)
+    return data.user || null
   }
 
   const requestLogout = () => setConfirmAction({ type: 'logout' })
   const requestDeleteMessage = (messageId) => setConfirmAction({ type: 'delete_message', messageId })
   const requestDeleteMessages = (messageIds) => setConfirmAction({ type: 'delete_messages', messageIds })
-  const requestClearChat = () => setConfirmAction({ type: 'clear_chat' })
-  const requestDeleteChat = () => setConfirmAction({ type: 'delete_chat' })
+
+  const reactToMessage = async (messageId, emoji) => {
+    const normalizedMessageId = Number(messageId)
+    if (!Number.isInteger(normalizedMessageId)) return
+    try {
+      const data = await apiFetch(`/api/messages/${normalizedMessageId}/reactions`, {
+        method: 'PUT',
+        body: JSON.stringify({ emoji: String(emoji || '') }),
+      })
+      applyReactionUpdateToAllConversations(normalizedMessageId, data?.reactions || [])
+    } catch (err) {
+      setError(err.message)
+    }
+  }
 
   const runConfirmAction = async () => {
     if (!confirmAction) return
     if (confirmAction.type === 'delete_message') await deleteMessage(confirmAction.messageId)
     else if (confirmAction.type === 'delete_messages') await deleteMessages(confirmAction.messageIds)
-    else if (confirmAction.type === 'clear_chat') await clearChat()
-    else if (confirmAction.type === 'delete_chat') await deleteChat()
-    else if (confirmAction.type === 'logout') clearAuthSession('')
+    else if (confirmAction.type === 'logout') await clearAuthSession('', { notifyServer: true })
     setConfirmAction(null)
   }
 
   const startDirectCall = async (callType = 'video') => {
     if (activeConversationType !== 'direct' || !activeChat || !currentUser) return
+    if (activeChat?.hasBlockedMe || activeChat?.isBlockedByMe) {
+      setError('You can no longer message each other')
+      return
+    }
     const a = Number(currentUser.id)
     const b = Number(activeChat.id)
     const roomId = `call_${Math.min(a, b)}_${Math.max(a, b)}_${Date.now()}`
@@ -1049,8 +1577,12 @@ function App({ portalRole = 'user' }) {
     })
   }
 
-  const startCallToUser = (chatUser, callType = 'video') => {
+  const startCallToUser = async (chatUser, callType = 'video') => {
     if (!chatUser || !currentUser) return
+    if (chatUser?.hasBlockedMe || chatUser?.isBlockedByMe) {
+      setError('You can no longer message each other')
+      return
+    }
     const targetId = Number(chatUser.id)
     if (!Number.isInteger(targetId)) return
     const a = Number(currentUser.id)
@@ -1143,6 +1675,10 @@ function App({ portalRole = 'user' }) {
     }
   }
 
+  if (!authReady) {
+    return <ChatLoadingScreen portalBadgeLabel={portalBadgeLabel} />
+  }
+
   if (!token) {
     return (
       <AuthScreen
@@ -1171,6 +1707,7 @@ function App({ portalRole = 'user' }) {
       portalBadgeLabel={portalBadgeLabel}
       isMobileChatOpen={isMobileChatOpen}
       currentUser={currentUser}
+      refreshCurrentUser={refreshCurrentUser}
       requestLogout={requestLogout}
       searchQuery={searchQuery}
       setSearchQuery={setSearchQuery}
@@ -1181,6 +1718,7 @@ function App({ portalRole = 'user' }) {
       addingContact={addingContact}
       uploadingProfile={uploadingProfile}
       uploadProfileMedia={uploadProfileMedia}
+      updateOwnProfileNote={updateOwnProfileNote}
       error={error}
       filteredUsers={filteredUsers}
       activeConversation={activeConversation}
@@ -1198,15 +1736,18 @@ function App({ portalRole = 'user' }) {
       activeConversationType={activeConversationType}
       isProfileOpen={isProfileOpen}
       setIsProfileOpen={setIsProfileOpen}
-      profileMenuOpen={profileMenuOpen}
-      setProfileMenuOpen={setProfileMenuOpen}
-      requestClearChat={requestClearChat}
-      requestDeleteChat={requestDeleteChat}
+      toggleBlockUser={toggleBlockUser}
+      blockingUserId={blockingUserId}
+      exportConversationPdf={exportConversationPdf}
+      canExportConversation={canExportConversation}
       messageListRef={messageListRef}
       activeMessages={activeMessages}
       activeConversationNote={conversationMetaByUser[String(activeConversation?.id || '')]?.note || ''}
+      activeConversationCanEditNote={Boolean(conversationMetaByUser[String(activeConversation?.id || '')]?.canEditNote)}
+      saveActiveConversationNote={saveActiveConversationNote}
       requestDeleteMessage={requestDeleteMessage}
       requestDeleteMessages={requestDeleteMessages}
+      reactToMessage={reactToMessage}
       draftMessage={draftMessage}
       setDraftMessage={setDraftMessage}
       sendMessage={sendMessage}

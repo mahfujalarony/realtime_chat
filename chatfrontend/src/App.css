@@ -9,7 +9,7 @@
 /* WhatsApp style message bubbles */
 .message-bubble {
   position: relative;
-  max-width: 65%;
+  max-width: 100%;
   padding: 6px 7px 8px 9px;
   border-radius: 7.5px;
   box-shadow: 0 1px 0.5px rgba(11, 20, 26, 0.13);
@@ -19,6 +19,11 @@
   background-color: #d9fdd3;
   border-top-right-radius: 0;
   margin-left: auto;
+}
+
+.message-bubble.internal-history {
+  background-color: #e8f1ff;
+  box-shadow: 0 1px 0.5px rgba(40, 90, 160, 0.16);
 }
 
 .message-bubble.received {
@@ -37,6 +42,10 @@
   height: 0;
   border-left: 8px solid #d9fdd3;
   border-top: 8px solid transparent;
+}
+
+.message-bubble.internal-history::before {
+  border-left-color: #e8f1ff;
 }
 
 /* Message tail for received messages */
@@ -79,10 +88,55 @@
   box-sizing: border-box;
 }
 
+.call-overlay {
+  min-height: 100dvh;
+  min-height: 100svh;
+}
+
 @media (max-width: 767px) {
   .zego-call-mobile-fix {
     height: 100dvh;
     width: 100vw;
     overflow: hidden;
+  }
+}
+
+@media (max-width: 420px) {
+  .call-overlay-actions {
+    gap: 1.25rem;
+  }
+}
+
+@media (max-width: 767px) and (orientation: landscape) and (max-height: 560px) {
+  .call-overlay {
+    min-height: 100dvh;
+  }
+
+  .call-overlay .relative.z-10 {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding-top: max(12px, env(safe-area-inset-top));
+    padding-bottom: max(16px, env(safe-area-inset-bottom));
+  }
+
+  .call-overlay .relative.z-10 > :first-child,
+  .call-overlay .relative.z-10 > :last-child {
+    flex: 1 1 0;
+  }
+
+  .call-overlay .relative.z-10 > :first-child {
+    text-align: left;
+  }
+
+  .call-overlay .relative.z-10 > :last-child {
+    display: flex;
+    justify-content: center;
+  }
+
+  .call-overlay .call-overlay-actions {
+    max-width: 18rem;
+    margin-left: auto;
   }
 }

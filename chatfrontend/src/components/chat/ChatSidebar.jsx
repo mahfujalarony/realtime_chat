@@ -1,9 +1,13 @@
-import { ArrowLeft, Camera, EllipsisVertical, LogOut, MessageCirclePlus, Phone, Search, UserPlus, Users, Video } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { ArrowLeft, Camera, LogOut, MessageCirclePlus, Phone, Search, UserPlus, Users, Video } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+
+const SIDEBAR_ROW_HEIGHT = 112
+const SIDEBAR_OVERSCAN = 8
 
 function ChatSidebar({
   isMobileChatOpen,
   currentUser,
+  refreshCurrentUser,
   logout,
   searchQuery,
   setSearchQuery,
@@ -14,6 +18,7 @@ function ChatSidebar({
   addingContact,
   uploadingProfile,
   onUploadProfile,
+  onUpdateProfileNote,
   error,
   filteredUsers,
   activeConversation,
@@ -34,6 +39,28 @@ function ChatSidebar({
   const [lookupLoading, setLookupLoading] = useState(false)
   const [lookupResult, setLookupResult] = useState(null)
   const [lookupMessage, setLookupMessage] = useState('')
+  const [profileNoteDraft, setProfileNoteDraft] = useState('')
+  const [savingProfileNote, setSavingProfileNote] = useState(false)
+  const [sidebarScrollTop, setSidebarScrollTop] = useState(0)
+  const [sidebarViewportHeight, setSidebarViewportHeight] = useState(0)
+  const sidebarListRef = useRef(null)
+
+  useEffect(() => {
+    setProfileNoteDraft(String(currentUser?.profileNote || ''))
+  }, [currentUser?.profileNote, currentUser?.canEditConversationNote, isMyProfileOpen])
+
+  useEffect(() => {
+    const updateViewport = () => {
+      const node = sidebarListRef.current
+      if (!node) return
+      setSidebarViewportHeight(node.clientHeight || 0)
+    }
+
+    updateViewport()
+    if (typeof window === 'undefined') return undefined
+    window.addEventListener('resize', updateViewport)
+    return () => window.removeEventListener('resize', updateViewport)
+  }, [])
 
   const openAddContactScreen = () => {
     setIsMyProfileOpen(false)
@@ -43,6 +70,7 @@ function ChatSidebar({
   const openMyProfileScreen = () => {
     setIsAddContactOpen(false)
     setIsMyProfileOpen(true)
+    refreshCurrentUser?.().catch(() => null)
   }
 
   useEffect(() => {
@@ -110,6 +138,34 @@ function ChatSidebar({
 
   const isActiveConversation = (type, id) => activeConversation?.type === type && Number(activeConversation?.id) === Number(id)
   const isInternalUser = currentUser?.role === 'admin' || currentUser?.role === 'model_admin' || currentUser?.canHandleExternalChat
+  const virtualizedSidebar = useMemo(() => {
+    const total = filteredUsers.length
+    if (!total) {
+      return { items: [], topSpacer: 0, bottomSpacer: 0 }
+    }
+
+    const viewport = sidebarViewportHeight || SIDEBAR_ROW_HEIGHT * 6
+    const startIndex = Math.max(0, Math.floor(sidebarScrollTop / SIDEBAR_ROW_HEIGHT) - SIDEBAR_OVERSCAN)
+    const visibleCount = Math.ceil(viewport / SIDEBAR_ROW_HEIGHT) + SIDEBAR_OVERSCAN * 2
+    const endIndex = Math.min(total, startIndex + visibleCount)
+    const items = filteredUsers.slice(startIndex, endIndex)
+
+    return {
+      items,
+      topSpacer: startIndex * SIDEBAR_ROW_HEIGHT,
+      bottomSpacer: Math.max(0, (total - endIndex) * SIDEBAR_ROW_HEIGHT),
+    }
+  }, [filteredUsers, sidebarScrollTop, sidebarViewportHeight])
+
+  const saveProfileNote = async () => {
+    if (!currentUser?.canEditConversationNote || !onUpdateProfileNote) return
+    setSavingProfileNote(true)
+    try {
+      await onUpdateProfileNote(profileNoteDraft)
+    } finally {
+      setSavingProfileNote(false)
+    }
+  }
 
   return (
     <aside
@@ -155,9 +211,6 @@ function ChatSidebar({
             >
               <Users size={19} />
             </button>
-            <button type="button" className="rounded-full p-2 text-[#54656f] transition hover:bg-[#e6eaed]">
-              <EllipsisVertical size={19} />
-            </button>
             <button
               type="button"
               onClick={logout}
@@ -184,9 +237,11 @@ function ChatSidebar({
       {error ? <p className="m-3 rounded-md bg-red-100 px-3 py-2 text-xs text-red-700">{error}</p> : null}
 
       <ul
+        ref={sidebarListRef}
         className="flex-1 min-h-0 overflow-y-auto bg-[#f4f6f8] px-2 pb-2"
         onScroll={(event) => {
           const el = event.currentTarget
+          setSidebarScrollTop(el.scrollTop)
           const nearBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 120
           if (nearBottom) onReachListEnd?.()
         }}
@@ -214,7 +269,8 @@ function ChatSidebar({
             </div>
           </li>
         ) : null}
-        {filteredUsers.map((chatUser) => {
+        {virtualizedSidebar.topSpacer > 0 ? <li style={{ height: `${virtualizedSidebar.topSpacer}px` }} aria-hidden="true" /> : null}
+        {virtualizedSidebar.items.map((chatUser) => {
           const lastMessage = getLastMessageForUser(chatUser.id)
           return (
             <li key={`direct-${chatUser.id}`} className="px-1 py-1.5">
@@ -295,6 +351,7 @@ function ChatSidebar({
             </li>
           )
         })}
+        {virtualizedSidebar.bottomSpacer > 0 ? <li style={{ height: `${virtualizedSidebar.bottomSpacer}px` }} aria-hidden="true" /> : null}
 
       </ul>
 
@@ -315,7 +372,7 @@ function ChatSidebar({
             </button>
             <div>
               <p className="text-base font-semibold">New chat</p>
-              <p className="text-xs text-[#667781]">Add by username / unique id / email / mobile</p>
+              <p className="text-xs text-[#667781]">Add by unique id / email / mobile</p>
             </div>
           </header>
 
@@ -401,7 +458,7 @@ function ChatSidebar({
       ) : null}
 
       {isMyProfileOpen ? (
-        <section className="absolute inset-0 z-40 bg-[#f0f2f5]">
+        <section className="absolute inset-0 z-40 overflow-y-auto bg-[#f0f2f5]">
           <header className="flex items-center gap-4 bg-[#008069] px-4 py-4 text-white">
             <button
               type="button"
@@ -462,6 +519,30 @@ function ChatSidebar({
               <p className="text-xs text-[#667781]">Name</p>
               <p className="mt-1 text-base font-semibold text-[#1f2c34]">{currentUser?.username || '-'}</p>
             </div>
+
+            {currentUser?.canEditConversationNote ? (
+              <div className="mt-3 rounded-xl bg-white p-4 shadow-sm">
+                <p className="text-xs text-[#667781]">Note</p>
+                <textarea
+                  value={profileNoteDraft}
+                  onChange={(event) => setProfileNoteDraft(event.target.value)}
+                  rows={4}
+                  placeholder="Write your note"
+                  className="mt-2 w-full rounded-lg border border-[#d5dde2] px-3 py-2 text-sm text-[#1f2c34] outline-none focus:border-[#1aa34a]"
+                />
+                <div className="mt-3 flex items-center justify-between gap-3">
+                  <p className="text-[11px] text-[#667781]">This note is only visible when admin keeps Note access on.</p>
+                  <button
+                    type="button"
+                    onClick={saveProfileNote}
+                    disabled={savingProfileNote}
+                    className="shrink-0 rounded-lg bg-[#25d366] px-3 py-2 text-xs font-semibold text-white transition hover:bg-[#1fab53] disabled:opacity-60"
+                  >
+                    {savingProfileNote ? 'Saving...' : 'Save Note'}
+                  </button>
+                </div>
+              </div>
+            ) : null}
 
             <div className="mt-3 rounded-xl bg-white p-4 shadow-sm">
               <p className="text-xs text-[#667781]">Email</p>

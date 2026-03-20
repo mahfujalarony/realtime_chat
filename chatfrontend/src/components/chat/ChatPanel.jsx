@@ -1,8 +1,8 @@
-import { ArrowDownLeft, ArrowUpRight, ArrowLeft, Check, Clock3, Download, FileText, Loader2, Maximize2, Mic, MoreVertical, Paperclip, Pause, Phone, PhoneOff, Play, Square, Trash2, UsersRound, Video, X } from 'lucide-react'
+import { ArrowDownLeft, ArrowUpRight, ArrowLeft, Clock3, Download, FileText, Loader2, Maximize2, Mic, Paperclip, Pause, Phone, PhoneOff, Play, SmilePlus, Square, Trash2, UsersRound, Video, X } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
-import { Button } from '../ui/button'
 
-const AUDIO_MIME_CANDIDATES = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus']
+const AUDIO_MIME_CANDIDATES = ['audio/mp4;codecs=mp4a.40.2', 'audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/ogg']
+const REACTION_OPTIONS = ['👍', '❤️', '😂', '😮', '😢', '😡', '🙏']
 
 function formatDuration(totalSeconds) {
   if (!Number.isFinite(totalSeconds) || totalSeconds < 0) return '00:00'
@@ -14,7 +14,22 @@ function formatDuration(totalSeconds) {
 
 function pickSupportedAudioMimeType() {
   if (typeof MediaRecorder === 'undefined' || typeof MediaRecorder.isTypeSupported !== 'function') return ''
-  return AUDIO_MIME_CANDIDATES.find((type) => MediaRecorder.isTypeSupported(type)) || ''
+  const userAgent = typeof navigator !== 'undefined' ? String(navigator.userAgent || '').toLowerCase() : ''
+  const isFirefox = userAgent.includes('firefox')
+  const candidates = isFirefox
+    ? ['audio/ogg;codecs=opus', 'audio/ogg', 'audio/webm;codecs=opus', 'audio/webm', 'audio/mp4;codecs=mp4a.40.2', 'audio/mp4']
+    : AUDIO_MIME_CANDIDATES
+  return candidates.find((type) => MediaRecorder.isTypeSupported(type)) || ''
+}
+
+function normalizeAudioMimeType(mimeType) {
+  const raw = String(mimeType || '').trim().toLowerCase()
+  if (!raw) return ''
+  const base = raw.split(';')[0].trim()
+  if (!base) return ''
+  if (base === 'audio/x-m4a') return 'audio/mp4'
+  if (base === 'audio/x-wav') return 'audio/wav'
+  return base
 }
 
 function parseCallLogText(text) {
@@ -29,6 +44,18 @@ function parseCallLogText(text) {
     return { kind: completed[1].toLowerCase(), missed: false, durationText: completed[2] }
   }
   return null
+}
+
+function getHistoricalSenderLabel(sender) {
+  const role = String(sender?.role || 'user').toLowerCase()
+  if (role === 'admin') return 'Admin'
+  if (role === 'model_admin') return 'Model Admin'
+  if (sender?.canHandleExternalChat) return 'Agent'
+  return 'User'
+}
+
+function isInternalConversationSender(message, activeChat) {
+  return Number(message?.senderId) !== Number(activeChat?.id)
 }
 
 function ViewportMedia({ className = '', placeholderClassName = '', rootMargin = '220px', children }) {
@@ -66,27 +93,83 @@ function ViewportMedia({ className = '', placeholderClassName = '', rootMargin =
   )
 }
 
-function AudioMessageBubble({ url, fallbackDurationSec }) {
+function AudioMessageBubble({ url, fallbackDurationSec, controlsList, mimeType }) {
   const audioRef = useRef(null)
+  const progressIntervalRef = useRef(0)
+  const progressBarRef = useRef(null)
   const [isLoading, setIsLoading] = useState(true)
   const [isPlaying, setIsPlaying] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
+  const [hasPlaybackError, setHasPlaybackError] = useState(false)
   const [duration, setDuration] = useState(Number.isFinite(Number(fallbackDurationSec)) ? Number(fallbackDurationSec) : 0)
+  const normalizedMimeType = normalizeAudioMimeType(mimeType)
 
   const safeDuration = Number.isFinite(duration) && duration > 0 ? duration : 0
-
-  const onLoadedMetadata = () => {
+  const displayDuration = Math.max(safeDuration, currentTime, Number(fallbackDurationSec) || 0)
+  const progressPercent = displayDuration > 0 ? Math.min(100, Math.max(0, (currentTime / displayDuration) * 100)) : 0
+  const syncDurationFromElement = () => {
     const el = audioRef.current
     if (!el) return
-    if (Number.isFinite(el.duration) && el.duration > 0) setDuration(el.duration)
+    if (Number.isFinite(el.duration) && el.duration > 0) {
+      setDuration(el.duration)
+      return
+    }
+    if (el.seekable && el.seekable.length > 0) {
+      const seekableEnd = el.seekable.end(el.seekable.length - 1)
+      if (Number.isFinite(seekableEnd) && seekableEnd > 0) {
+        setDuration(seekableEnd)
+        return
+      }
+    }
+    if ((el.currentTime || 0) > 0) {
+      setDuration((prev) => Math.max(prev, el.currentTime || 0))
+    }
+  }
+
+  const onLoadedMetadata = () => {
+    syncDurationFromElement()
     setIsLoading(false)
+    setHasPlaybackError(false)
   }
 
   const onTimeUpdate = () => {
     const el = audioRef.current
     if (!el) return
     setCurrentTime(el.currentTime || 0)
+    syncDurationFromElement()
   }
+
+  useEffect(() => {
+    if (!isPlaying) {
+      if (progressIntervalRef.current) {
+        clearInterval(progressIntervalRef.current)
+        progressIntervalRef.current = 0
+      }
+      return
+    }
+
+    const tick = () => {
+      const el = audioRef.current
+      if (!el) return
+      const nextTime = el.currentTime || 0
+      setCurrentTime((prev) => (Math.abs(prev - nextTime) >= 0.08 ? nextTime : prev))
+      syncDurationFromElement()
+    }
+
+    tick()
+    progressIntervalRef.current = window.setInterval(() => {
+      const el = audioRef.current
+      if (!el || el.paused || el.ended) return
+      tick()
+    }, 180)
+
+    return () => {
+      if (progressIntervalRef.current) {
+        clearInterval(progressIntervalRef.current)
+        progressIntervalRef.current = 0
+      }
+    }
+  }, [isPlaying])
 
   const onPlay = () => {
     const currentEl = audioRef.current
@@ -100,11 +183,40 @@ function AudioMessageBubble({ url, fallbackDurationSec }) {
 
   const onPause = () => setIsPlaying(false)
 
-  const onSeek = (event) => {
+  const onAudioError = () => {
+    setIsLoading(false)
+    setIsPlaying(false)
+    setHasPlaybackError(true)
+  }
+
+  const seekToPosition = (clientX) => {
     const el = audioRef.current
-    if (!el) return
-    const nextTime = Number(event.target.value)
-    if (!Number.isFinite(nextTime)) return
+    const track = progressBarRef.current
+    if (!el || !track || !displayDuration) return
+    const rect = track.getBoundingClientRect()
+    if (!rect.width) return
+    const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width))
+    const nextTime = ratio * displayDuration
+    el.currentTime = nextTime
+    setCurrentTime(nextTime)
+  }
+
+  const onSeek = (event) => {
+    seekToPosition(event.clientX)
+  }
+
+  const onSeekKeyDown = (event) => {
+    const el = audioRef.current
+    if (!el || !displayDuration) return
+    const step = Math.max(1, displayDuration / 20)
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight' && event.key !== 'Home' && event.key !== 'End') return
+    event.preventDefault()
+    let nextTime = el.currentTime || 0
+    if (event.key === 'ArrowLeft') nextTime -= step
+    if (event.key === 'ArrowRight') nextTime += step
+    if (event.key === 'Home') nextTime = 0
+    if (event.key === 'End') nextTime = displayDuration
+    nextTime = Math.min(displayDuration, Math.max(0, nextTime))
     el.currentTime = nextTime
     setCurrentTime(nextTime)
   }
@@ -124,47 +236,74 @@ function AudioMessageBubble({ url, fallbackDurationSec }) {
   }
 
   return (
-    <div className="mb-1 w-[240px] rounded-lg bg-black/5 px-3 py-2 md:w-[300px]">
+    <div className="mb-1 w-[min(240px,70vw)] max-w-full rounded-lg bg-black/5 px-3 py-2 md:w-[300px]">
       <audio
         ref={audioRef}
         src={url}
         preload="metadata"
         data-chat-audio="1"
+        controlsList={controlsList}
+        data-mime-type={normalizedMimeType || undefined}
         className="hidden"
         onLoadedMetadata={onLoadedMetadata}
+        onLoadedData={() => {
+          syncDurationFromElement()
+          setIsLoading(false)
+        }}
+        onDurationChange={syncDurationFromElement}
         onTimeUpdate={onTimeUpdate}
         onPlay={onPlay}
         onPause={onPause}
         onEnded={onPause}
+        onError={onAudioError}
       />
 
       <div className="flex items-center gap-2">
         <button
           type="button"
           onClick={togglePlay}
-          className="flex h-9 w-9 items-center justify-center rounded-full bg-[#00a884] text-white transition hover:bg-[#02916f]"
+          disabled={hasPlaybackError}
+          className="shrink-0 flex h-9 w-9 items-center justify-center rounded-full bg-[#00a884] text-white transition hover:bg-[#02916f]"
           aria-label={isPlaying ? 'Pause audio' : 'Play audio'}
         >
           {isLoading ? <Loader2 size={16} className="animate-spin" /> : isPlaying ? <Pause size={16} /> : <Play size={16} />}
         </button>
 
-        <input
-          type="range"
-          min="0"
-          max={safeDuration || 0}
-          step="0.1"
-          value={Math.min(currentTime, safeDuration || 0)}
-          onChange={onSeek}
-          disabled={!safeDuration}
-          className="h-1 flex-1 cursor-pointer accent-[#00a884]"
-          aria-label="Audio seek"
-        />
+        <div className="min-w-0 flex-1 px-1">
+          <button
+            ref={progressBarRef}
+            type="button"
+            onClick={onSeek}
+            onKeyDown={onSeekKeyDown}
+            disabled={!displayDuration}
+            className="audio-progress-bar relative block h-6 w-full disabled:cursor-not-allowed disabled:opacity-60"
+            aria-label="Audio seek"
+            aria-valuemin={0}
+            aria-valuemax={Math.round(displayDuration)}
+            aria-valuenow={Math.round(Math.min(currentTime, displayDuration))}
+            aria-valuetext={`${formatDuration(currentTime)} of ${formatDuration(displayDuration)}`}
+            role="slider"
+          >
+            <span className="audio-progress-bar__track absolute inset-x-0 top-1/2 h-1 -translate-y-1/2 rounded-full bg-[#3f3f46]" />
+            <span
+              className="audio-progress-bar__fill absolute left-0 top-1/2 h-1 -translate-y-1/2 rounded-full bg-[#3f3f46]"
+              style={{ width: `${progressPercent}%` }}
+            />
+            <span
+              className="audio-progress-bar__thumb absolute top-1/2 h-4 w-4 -translate-y-1/2 rounded-full bg-[#00a884] shadow-[0_0_0_2px_#fff,0_1px_3px_rgba(0,0,0,0.18)]"
+              style={{ left: `calc(${progressPercent}% - 8px)` }}
+            />
+          </button>
+        </div>
       </div>
 
       <div className="mt-1 flex items-center justify-between text-[11px] text-[#667781]">
         <span>{formatDuration(currentTime)}</span>
-        <span>{formatDuration(safeDuration)}</span>
+        <span>{formatDuration(displayDuration)}</span>
       </div>
+      {hasPlaybackError ? (
+        <p className="mt-1 text-[11px] text-[#cc1744]">Audio format not supported on this device/browser.</p>
+      ) : null}
     </div>
   )
 }
@@ -179,18 +318,20 @@ function ChatPanel({
   startAudioCall,
   startVideoCall,
   getInitials,
-  profileMenuOpen,
-  setProfileMenuOpen,
-  requestClearChat,
-  requestDeleteChat,
+  exportConversationPdf,
+  canExportConversation,
   messageListRef,
   activeMessages,
   currentUser,
   formatTime,
   formatLastSeen,
+  isBlockedByMe,
+  hasBlockedMe,
   activeConversationNote,
+  activeConversationCanEditNote,
+  saveActiveConversationNote,
   requestDeleteMessage,
-  requestDeleteMessages,
+  reactToMessage,
   draftMessage,
   setDraftMessage,
   sendMessage,
@@ -212,18 +353,72 @@ function ChatPanel({
   const recordingStreamRef = useRef(null)
   const recordingTimerRef = useRef(null)
   const recordingSecondsRef = useRef(0)
+  const recordingStartedAtRef = useRef(0)
   const audioChunksRef = useRef([])
   const [isRecording, setIsRecording] = useState(false)
   const [recordingSeconds, setRecordingSeconds] = useState(0)
   const [recordingError, setRecordingError] = useState('')
   const [previewMedia, setPreviewMedia] = useState(null)
-  const [selectedMessageIds, setSelectedMessageIds] = useState([])
   const seenCheckRafRef = useRef(null)
   const lastScrollTopRef = useRef(0)
   const ignoreOlderLoadUntilRef = useRef(0)
-  const longPressTimerRef = useRef(null)
-  const profileMenuRef = useRef(null)
   const [keyboardInset, setKeyboardInset] = useState(0)
+  const [isEditingNote, setIsEditingNote] = useState(false)
+  const [isNoteExpanded, setIsNoteExpanded] = useState(false)
+  const [noteDraft, setNoteDraft] = useState('')
+  const [savingNote, setSavingNote] = useState(false)
+  const [copiedMessageId, setCopiedMessageId] = useState(null)
+  const [reactionPicker, setReactionPicker] = useState(null)
+  const [reactionDetails, setReactionDetails] = useState(null)
+  const isConversationBlocked = Boolean(isBlockedByMe || hasBlockedMe)
+  const canSendToActiveChat = Boolean(activeChat) && !isConversationBlocked
+  const reactionLongPressTimerRef = useRef(null)
+  const isStaffViewer = ['admin', 'model_admin'].includes(String(currentUser?.role || '').toLowerCase()) || Boolean(currentUser?.canHandleExternalChat)
+  const canDownloadMedia = Boolean(currentUser?.canDownloadConversations)
+  const canDownloadFile = true
+
+  const copyMessageText = async (text, messageId) => {
+    const raw = String(text || '')
+    if (!raw.trim()) return
+    try {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(raw)
+      } else {
+        const el = document.createElement('textarea')
+        el.value = raw
+        el.setAttribute('readonly', '')
+        el.style.position = 'fixed'
+        el.style.opacity = '0'
+        document.body.appendChild(el)
+        el.focus()
+        el.select()
+        document.execCommand('copy')
+        document.body.removeChild(el)
+      }
+      setCopiedMessageId(messageId)
+      window.setTimeout(() => {
+        setCopiedMessageId((prev) => (prev === messageId ? null : prev))
+      }, 1200)
+    } catch {
+      // Ignore clipboard errors to avoid breaking chat interactions.
+    }
+  }
+
+  useEffect(() => {
+    setIsEditingNote(false)
+    setIsNoteExpanded(false)
+    setNoteDraft(String(activeConversationNote || ''))
+    setReactionDetails(null)
+  }, [activeConversationNote, activeChat?.id])
+
+  const onSaveNote = async () => {
+    if (!activeConversationCanEditNote || typeof saveActiveConversationNote !== 'function') return
+    setSavingNote(true)
+    const ok = await saveActiveConversationNote(noteDraft)
+    setSavingNote(false)
+    if (ok) setIsEditingNote(false)
+    return ok
+  }
 
   const cleanupStream = () => {
     if (recordingTimerRef.current) {
@@ -237,6 +432,7 @@ function ChatPanel({
     recorderRef.current = null
     audioChunksRef.current = []
     recordingSecondsRef.current = 0
+    recordingStartedAtRef.current = 0
     setRecordingSeconds(0)
     setIsRecording(false)
   }
@@ -250,70 +446,31 @@ function ChatPanel({
       const recorder = recorderRef.current
       if (recorder && recorder.state !== 'inactive') recorder.stop()
       cleanupStream()
-      if (longPressTimerRef.current) {
-        clearTimeout(longPressTimerRef.current)
-        longPressTimerRef.current = null
+      if (reactionLongPressTimerRef.current) {
+        clearTimeout(reactionLongPressTimerRef.current)
+        reactionLongPressTimerRef.current = null
       }
     }
   }, [])
 
   useEffect(() => {
-    setSelectedMessageIds([])
-  }, [activeChat?.id, activeConversationType])
-
-  useEffect(() => {
-    if (!profileMenuOpen) return undefined
-    const handleOutside = (event) => {
-      const host = profileMenuRef.current
-      if (!host) return
-      if (!host.contains(event.target)) {
-        setProfileMenuOpen(false)
-      }
-    }
-    document.addEventListener('mousedown', handleOutside)
-    document.addEventListener('touchstart', handleOutside, { passive: true })
+    if (!reactionPicker) return undefined
+    const close = () => setReactionPicker(null)
+    window.addEventListener('mousedown', close)
+    window.addEventListener('touchstart', close, { passive: true })
     return () => {
-      document.removeEventListener('mousedown', handleOutside)
-      document.removeEventListener('touchstart', handleOutside)
+      window.removeEventListener('mousedown', close)
+      window.removeEventListener('touchstart', close)
     }
-  }, [profileMenuOpen, setProfileMenuOpen])
+  }, [reactionPicker])
 
-  const clearLongPressTimer = () => {
-    if (!longPressTimerRef.current) return
-    clearTimeout(longPressTimerRef.current)
-    longPressTimerRef.current = null
-  }
-
-  const startLongPressDelete = (message) => {
-    clearLongPressTimer()
-    longPressTimerRef.current = setTimeout(() => {
-      const messageId = Number(message?.id)
-      if (!Number.isInteger(messageId)) return
-      setSelectedMessageIds((prev) => (prev.includes(messageId) ? prev : [...prev, messageId]))
-      if (navigator.vibrate) navigator.vibrate(20)
-      longPressTimerRef.current = null
-    }, 480)
-  }
-
-  const toggleSelectMessage = (message) => {
-    const messageId = Number(message?.id)
-    if (!Number.isInteger(messageId)) return
-    setSelectedMessageIds((prev) => (prev.includes(messageId) ? prev.filter((id) => id !== messageId) : [...prev, messageId]))
-  }
-
-  const clearSelectionMode = () => setSelectedMessageIds([])
-
-  const deleteSelectedMessages = () => {
-    if (!selectedMessageIds.length) return
-    requestDeleteMessages?.(selectedMessageIds)
-    setSelectedMessageIds([])
-  }
-
-  const selectAllOwnMessages = () => {
-    const mineIds = (activeMessages || [])
-      .filter((message) => Number(message.senderId) === Number(currentUser?.id) && Number.isInteger(Number(message.id)))
-      .map((message) => Number(message.id))
-    setSelectedMessageIds(Array.from(new Set(mineIds)))
+  const openReactionDetails = (message, reaction) => {
+    if (!message?.id || !reaction?.emoji) return
+    setReactionDetails({
+      messageId: Number(message.id),
+      emoji: String(reaction.emoji),
+      reactors: Array.isArray(reaction.reactors) ? reaction.reactors : [],
+    })
   }
 
   const maybeMarkSeenWhenLastVisible = () => {
@@ -445,6 +602,7 @@ function ChatPanel({
       recorderRef.current = recorder
       audioChunksRef.current = []
       recordingSecondsRef.current = 0
+      recordingStartedAtRef.current = Date.now()
       setRecordingSeconds(0)
       setIsRecording(true)
 
@@ -454,9 +612,12 @@ function ChatPanel({
       recorder.onstop = async () => {
         const preferredType = recorder.mimeType || mimeType || 'audio/webm'
         const blob = new Blob(audioChunksRef.current, { type: preferredType })
-        const durationSec = recordingSecondsRef.current
+        const elapsedFromClock = recordingStartedAtRef.current > 0
+          ? Math.floor((Date.now() - recordingStartedAtRef.current) / 1000)
+          : 0
+        const durationSec = Math.max(recordingSecondsRef.current, elapsedFromClock, 1)
         cleanupStream()
-        if (blob.size < 2048 || durationSec <= 0) {
+        if (blob.size < 2048) {
           setRecordingError('Record was too short. Please try again.')
           return
         }
@@ -468,9 +629,16 @@ function ChatPanel({
         cleanupStream()
         setRecordingError('Recording failed. Please allow microphone and retry.')
       }
-      recorder.start(250)
+      recorder.start()
       recordingTimerRef.current = setInterval(() => {
-        recordingSecondsRef.current += 1
+        if (recordingStartedAtRef.current > 0) {
+          recordingSecondsRef.current = Math.max(
+            recordingSecondsRef.current + 1,
+            Math.floor((Date.now() - recordingStartedAtRef.current) / 1000),
+          )
+        } else {
+          recordingSecondsRef.current += 1
+        }
         setRecordingSeconds(recordingSecondsRef.current)
       }, 1000)
     } catch {
@@ -536,25 +704,64 @@ function ChatPanel({
     return items
   }
 
+  const clearReactionLongPressTimer = () => {
+    if (!reactionLongPressTimerRef.current) return
+    clearTimeout(reactionLongPressTimerRef.current)
+    reactionLongPressTimerRef.current = null
+  }
+
+  const getReactionAnchorElement = (targetElement) => {
+    const element = targetElement instanceof HTMLElement ? targetElement : null
+    if (!element) return null
+    if (element.dataset.reactionAnchor === 'true') return element
+    const row = element.closest('[data-message-row="true"]')
+    return row?.querySelector?.('[data-reaction-anchor="true"]') || element
+  }
+
+  const openReactionPickerAt = (message, targetElement) => {
+    const messageId = Number(message?.id)
+    if (!Number.isInteger(messageId)) return
+    const element = getReactionAnchorElement(targetElement)
+    const rect = element?.getBoundingClientRect?.()
+    if (!rect) return
+    const viewportWidth = typeof window !== 'undefined' ? window.innerWidth : 0
+    const viewportHeight = typeof window !== 'undefined' ? window.innerHeight : 0
+    const pickerWidth = 300
+    const pickerHeight = 56
+    const edge = 12
+
+    const desiredLeft = rect.left + rect.width / 2
+    const minLeft = edge + pickerWidth / 2
+    const maxLeft = Math.max(minLeft, viewportWidth - edge - pickerWidth / 2)
+    const left = Math.max(minLeft, Math.min(maxLeft, desiredLeft))
+
+    const topCandidate = rect.top - 10
+    const shouldOpenBelow = topCandidate < pickerHeight + edge
+    const top = shouldOpenBelow ? Math.min(viewportHeight - edge, rect.bottom + 10) : topCandidate
+    setReactionPicker({ messageId, x: left, y: top, placeBelow: shouldOpenBelow })
+  }
+
+  const onMessageLongPressStart = (message, targetElement) => {
+    const messageId = Number(message?.id)
+    if (!Number.isInteger(messageId)) return
+    clearReactionLongPressTimer()
+    reactionLongPressTimerRef.current = setTimeout(() => {
+      openReactionPickerAt(message, targetElement)
+      reactionLongPressTimerRef.current = null
+      if (navigator.vibrate) navigator.vibrate(12)
+    }, 420)
+  }
+
+  const onReactionPick = async (emoji) => {
+    if (!reactionPicker?.messageId || typeof reactToMessage !== 'function') return
+    await reactToMessage(reactionPicker.messageId, emoji)
+    setReactionPicker(null)
+  }
+
   return (
     <section className={`h-full w-full min-h-0 flex-col ${isMobileChatOpen ? 'flex' : 'hidden md:flex md:flex-col'}`}>
       <header className="flex items-center gap-3 border-b border-[#e4e4e4] bg-[#f0f2f5] px-4 py-3">
-        {selectedMessageIds.length > 0 ? (
-          <>
-            <button type="button" onClick={clearSelectionMode} className="rounded-full p-1 text-[#54656f] transition hover:bg-[#e6eaed]" aria-label="Cancel selection">
-              <ArrowLeft size={20} />
-            </button>
-            <p className="text-sm font-semibold text-[#1f2c34]">{selectedMessageIds.length} selected</p>
-            <div className="ml-auto flex items-center gap-2">
-              <Button type="button" variant="outline" size="sm" onClick={selectAllOwnMessages} className="h-8 px-3 text-xs">
-                Select all
-              </Button>
-              <Button type="button" variant="destructive" size="sm" onClick={deleteSelectedMessages} className="h-8 px-3 text-xs">
-                Delete
-              </Button>
-            </div>
-          </>
-        ) : activeChat ? (
+        {activeChat ? (
           <>
             <button
               type="button"
@@ -587,54 +794,39 @@ function ChatPanel({
                   : activeChat.isOnline ? 'online' : formatLastSeen(activeChat.lastSeen)}
               </p>
             </button>
-            <div ref={profileMenuRef} className="relative ml-auto flex items-center">
+            <div className="ml-auto flex items-center">
               {activeConversationType === 'direct' ? (
                 <div className="mr-1 inline-flex items-center gap-1">
                   <button
                     type="button"
                     onClick={startAudioCall}
-                    className="rounded-full p-2 text-[#54656f] transition hover:bg-[#e7ecef]"
+                    disabled={!canSendToActiveChat}
+                    className="rounded-full p-2 text-[#54656f] transition hover:bg-[#e7ecef] disabled:cursor-not-allowed disabled:opacity-50"
                     title="Audio call"
                     aria-label="Audio call"
                   >
                     <Phone size={18} />
                   </button>
+                  {canExportConversation ? (
+                    <button
+                      type="button"
+                      onClick={exportConversationPdf}
+                      className="rounded-full p-2 text-[#54656f] transition hover:bg-[#e7ecef]"
+                      title="Export chat as PDF"
+                      aria-label="Export chat as PDF"
+                    >
+                      <Download size={18} />
+                    </button>
+                  ) : null}
                   <button
                     type="button"
                     onClick={startVideoCall}
-                    className="rounded-full p-2 text-[#54656f] transition hover:bg-[#e7ecef]"
+                    disabled={!canSendToActiveChat}
+                    className="rounded-full p-2 text-[#54656f] transition hover:bg-[#e7ecef] disabled:cursor-not-allowed disabled:opacity-50"
                     title="Video call"
                     aria-label="Video call"
                   >
                     <Video size={18} />
-                  </button>
-                </div>
-              ) : null}
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-sm"
-                onClick={() => setProfileMenuOpen((prev) => !prev)}
-                className="h-8 w-8 rounded-full text-[#54656f] hover:bg-[#e7ecef]"
-                aria-label="More options"
-              >
-                <MoreVertical size={18} />
-              </Button>
-              {profileMenuOpen && activeConversationType === 'direct' ? (
-                <div className="absolute right-0 top-10 z-10 w-44 rounded-lg border border-[#e4e4e4] bg-white p-1 shadow-lg">
-                  <button
-                    type="button"
-                    onClick={requestClearChat}
-                    className="w-full rounded-md px-3 py-2 text-left text-sm text-[#111b21] hover:bg-[#f3f5f7]"
-                  >
-                    Clear chat
-                  </button>
-                  <button
-                    type="button"
-                    onClick={requestDeleteChat}
-                    className="w-full rounded-md px-3 py-2 text-left text-sm text-[#cc1744] hover:bg-[#fff2f4]"
-                  >
-                    Delete chat
                   </button>
                 </div>
               ) : null}
@@ -645,13 +837,153 @@ function ChatPanel({
         )}
       </header>
 
+      {activeChat && activeConversationType === 'direct' ? (
+        <div className="border-b border-[#e3e9ee] bg-[linear-gradient(180deg,#f7fafc_0%,#eef4f6_100%)] px-4 py-1.5 md:px-12">
+          <div className="mx-auto max-w-3xl">
+            {activeConversationNote ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setIsEditingNote(false)
+                  setIsNoteExpanded(true)
+                }}
+                className="flex w-full items-center gap-2 rounded-xl border border-[#d8e2ea] bg-white/90 px-2.5 py-1.5 text-left shadow-[0_6px_16px_rgba(15,23,42,0.05)] transition hover:border-[#c7d5e0] hover:bg-white"
+              >
+                <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-[#edf5ff] text-[#295f98]">
+                  <FileText size={14} />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[#617787]">Note</p>
+                  <p className="truncate text-xs text-[#243746]">{activeConversationNote}</p>
+                </div>
+                <div className="shrink-0 rounded-full bg-[#f4f7fa] px-2 py-0.5 text-[10px] font-semibold text-[#3e5465]">
+                  View
+                </div>
+              </button>
+            ) : activeConversationCanEditNote ? (
+              <div className="flex items-center justify-between gap-2 rounded-xl border border-dashed border-[#cad6df] bg-white/80 px-2.5 py-1.5 shadow-[0_6px_16px_rgba(15,23,42,0.04)]">
+                <div className="min-w-0">
+                  <p className="text-xs font-semibold text-[#273947]">No note added</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setNoteDraft('')
+                    setIsEditingNote(true)
+                    setIsNoteExpanded(true)
+                  }}
+                  className="inline-flex shrink-0 items-center justify-center rounded-full bg-[#214e78] px-2.5 py-1 text-[10px] font-semibold text-white shadow-sm transition hover:bg-[#193f61]"
+                >
+                  Add note
+                </button>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
+      {activeChat && activeConversationType === 'direct' && isNoteExpanded ? (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/35 p-4" onClick={() => {
+          setIsNoteExpanded(false)
+          setIsEditingNote(false)
+          setNoteDraft(String(activeConversationNote || ''))
+        }}>
+          <div
+            className="w-full max-w-lg rounded-3xl border border-[#d6e0e7] bg-white p-5 shadow-[0_24px_80px_rgba(15,23,42,0.24)]"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-start gap-3">
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-[#edf5ff] text-[#295f98]">
+                <FileText size={18} />
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[#617787]">Note</p>
+                    <p className="mt-1 text-sm text-[#6b7f8d]">Private note for this direct conversation.</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsNoteExpanded(false)
+                      setIsEditingNote(false)
+                      setNoteDraft(String(activeConversationNote || ''))
+                    }}
+                    className="rounded-full p-2 text-[#617787] transition hover:bg-[#f3f6f8]"
+                    aria-label="Close note"
+                  >
+                    <X size={18} />
+                  </button>
+                </div>
+
+                {!isEditingNote ? (
+                  <>
+                    <div className="mt-4 rounded-2xl bg-[#f6f9fb] px-4 py-3 text-sm leading-6 text-[#243746]">
+                      {activeConversationNote ? (
+                        <p className="whitespace-pre-wrap wrap-break-word">{activeConversationNote}</p>
+                      ) : (
+                        <p className="text-[#6a7d8c]">No note added yet.</p>
+                      )}
+                    </div>
+                    {activeConversationCanEditNote ? (
+                      <div className="mt-4 flex justify-end">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setNoteDraft(String(activeConversationNote || ''))
+                            setIsEditingNote(true)
+                          }}
+                          className="rounded-full bg-[#214e78] px-3 py-1.5 text-[11px] font-semibold text-white shadow-sm transition hover:bg-[#193f61]"
+                        >
+                          {activeConversationNote ? 'Edit note' : 'Add note'}
+                        </button>
+                      </div>
+                    ) : null}
+                  </>
+                ) : (
+                  <div className="mt-4 space-y-3">
+                    <textarea
+                      value={noteDraft}
+                      onChange={(event) => setNoteDraft(event.target.value)}
+                      rows={5}
+                      placeholder="Add internal note"
+                      className="w-full rounded-2xl border border-[#cfdae4] bg-[#fbfdff] px-3 py-2 text-sm text-[#243746] outline-none transition focus:border-[#8aa9c2] focus:bg-white"
+                    />
+                    <div className="flex items-center justify-end gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsEditingNote(false)
+                          setNoteDraft(String(activeConversationNote || ''))
+                        }}
+                        className="rounded-full border border-[#d6dee6] bg-white px-3 py-1.5 text-[11px] font-semibold text-[#4f6474]"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          const ok = await onSaveNote()
+                          if (ok) {
+                            setIsNoteExpanded(false)
+                          }
+                        }}
+                        disabled={savingNote}
+                        className="rounded-full bg-[#214e78] px-3 py-1.5 text-[11px] font-semibold text-white shadow-sm transition hover:bg-[#193f61] disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {savingNote ? 'Saving...' : 'Save note'}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       <div ref={messageListRef} className="chat-wallpaper chat-scrollbar flex-1 overflow-y-auto px-4 py-2 md:px-12">
         <div className="messages-container mx-auto max-w-3xl">
-          {activeConversationNote ? (
-            <div className="mx-auto my-2 rounded-lg border border-[#ffe7a8] bg-[#fff7d8] px-3 py-2 text-xs text-[#7d5b00] shadow-sm">
-              <span className="font-semibold">Admin note:</span> {activeConversationNote}
-            </div>
-          ) : null}
           {loadingOlderMessages ? (
             <div className="mx-auto my-2 w-fit rounded-full bg-white/90 px-3 py-1 text-[11px] text-[#667781] shadow">
               Loading older messages...
@@ -669,6 +1001,11 @@ function ChatPanel({
               const isMine = currentUser && Number(message.senderId) === Number(currentUser.id)
               const isTempMessage = typeof message.id === 'string'
               const prevMessage = activeMessages[index - 1]
+              const isDirectExternalMessage = activeConversationType === 'direct' && Number(message.senderId) === Number(activeChat?.id)
+              const isHistoricalInternalMessage = activeConversationType === 'direct' && !isMine && !isDirectExternalMessage
+              const alignAsOutgoing = Boolean(
+                isMine || (activeConversationType === 'direct' && isStaffViewer && isInternalConversationSender(message, activeChat)),
+              )
               const albumCandidate = isAlbumMedia(message)
               const isContinuationOfAlbum =
                 albumCandidate &&
@@ -693,10 +1030,8 @@ function ChatPanel({
                   ? 'delivered'
                   : formatTime(message.createdAt))
               const isDeliveredLabel = metaText === 'delivered'
-              const messageIdNum = Number(message?.id)
-              const isSelected = Number.isInteger(messageIdNum) && selectedMessageIds.includes(messageIdNum)
               if (callLog) {
-                const isOutgoingCallLog = currentUser && Number(message.senderId) === Number(currentUser.id)
+                const isOutgoingCallLog = alignAsOutgoing
                 const callToneClass = callLog.missed
                   ? 'border-[#ffd9de] bg-[#fff1f3] text-[#cf294f]'
                   : 'border-[#cdeedd] bg-[#ebfff3] text-[#0c8f4f]'
@@ -747,42 +1082,34 @@ function ChatPanel({
                 <div
                   key={message.id}
                   data-message-id={message.id}
-                  className={`group flex items-end gap-1 ${isMine ? 'flex-row-reverse' : 'flex-row'} ${showTail ? 'mt-2' : 'mt-0.5'}`}
+                  data-message-row="true"
+                  className={`group flex items-end gap-1 ${alignAsOutgoing ? 'flex-row-reverse' : 'flex-row'} ${showTail ? 'mt-2' : 'mt-0.5'}`}
                 >
-                  <div
-                    className={`relative message-bubble ${isMine ? 'sent' : 'received'} ${!showTail ? (isMine ? '!rounded-tr-lg' : '!rounded-tl-lg') : ''} ${
-                      isSelected
-                        ? isMine
-                          ? 'ring-2 ring-[#25d366] bg-[#d7f9e6] shadow-[0_0_0_1px_rgba(37,211,102,0.25)]'
-                          : 'ring-2 ring-[#25d366] bg-[#eef9f3] shadow-[0_0_0_1px_rgba(37,211,102,0.25)]'
-                        : ''
-                    }`}
-                    style={{ maxWidth: '65%' }}
-                    onClick={() => {
-                      if (selectedMessageIds.length > 0 && activeConversationType === 'direct' && isMine && !isTempMessage) {
-                        toggleSelectMessage(message)
-                      }
-                    }}
-                    onTouchStart={() => {
-                      if (activeConversationType === 'direct' && isMine && !isTempMessage) startLongPressDelete(message)
-                    }}
-                    onTouchEnd={clearLongPressTimer}
-                    onTouchCancel={clearLongPressTimer}
-                    onTouchMove={clearLongPressTimer}
-                    onContextMenu={(event) => {
-                      if (activeConversationType === 'direct' && isMine && !isTempMessage) {
+              <div className={`relative flex max-w-[82%] flex-col sm:max-w-[75%] md:max-w-[65%] ${alignAsOutgoing ? 'items-end' : 'items-start'}`}>
+                    <div
+                      data-reaction-anchor="true"
+                      className={`relative w-fit max-w-full message-bubble select-none ${alignAsOutgoing ? 'sent' : 'received'} ${isHistoricalInternalMessage && isStaffViewer ? 'internal-history' : ''} ${!showTail ? (alignAsOutgoing ? '!rounded-tr-lg' : '!rounded-tl-lg') : ''}`}
+                      onSelectStart={(event) => event.preventDefault()}
+                      onContextMenu={(event) => {
+                        if (activeConversationType !== 'direct' || typeof reactToMessage !== 'function' || isTempMessage) return
                         event.preventDefault()
-                        requestDeleteMessage(message.id)
-                      }
-                    }}
-                  >
-                    {isSelected ? (
-                      <span className="absolute -left-2 -top-2 z-10 inline-flex h-5 w-5 items-center justify-center rounded-full bg-[#25d366] text-white shadow">
-                        <Check size={12} />
-                      </span>
-                    ) : null}
+                        openReactionPickerAt(message, event.currentTarget)
+                      }}
+                      onTouchStart={(event) => {
+                        if (activeConversationType !== 'direct' || typeof reactToMessage !== 'function' || isTempMessage) return
+                        onMessageLongPressStart(message, event.currentTarget)
+                      }}
+                      onTouchEnd={clearReactionLongPressTimer}
+                      onTouchMove={clearReactionLongPressTimer}
+                      onTouchCancel={clearReactionLongPressTimer}
+                    >
                     {!isMine && activeConversationType === 'group' && showTail ? (
                       <p className="mb-1 text-[11px] font-medium text-[#008069]">{groupMemberNames[message.senderId] || 'Member'}</p>
+                    ) : null}
+                    {isHistoricalInternalMessage && showTail && isStaffViewer ? (
+                      <p className="mb-1 text-[11px] font-medium text-[#0b6bcb]">
+                        {(message.sender?.username || 'Team member')} • {getHistoricalSenderLabel(message.sender)}
+                      </p>
                     ) : null}
 
                     {showAsAlbum ? (
@@ -807,14 +1134,16 @@ function ChatPanel({
                                   )}
                                 </ViewportMedia>
                               </button>
-                              <a
-                                href={`${item.mediaUrl}${item.mediaUrl.includes('?') ? '&' : '?'}download=1`}
-                                download={item.mediaOriginalName || true}
-                                className="absolute right-1 top-1 rounded-full bg-black/55 p-1 text-white opacity-0 transition group-hover/album:opacity-100"
-                                title="Download image"
-                              >
-                                <Download size={12} />
-                              </a>
+                              {canDownloadMedia ? (
+                                <a
+                                  href={`${item.mediaUrl}${item.mediaUrl.includes('?') ? '&' : '?'}download=1`}
+                                  download={item.mediaOriginalName || true}
+                                  className="absolute right-1 top-1 rounded-full bg-black/55 p-1 text-white opacity-0 transition group-hover/album:opacity-100"
+                                  title="Download image"
+                                >
+                                  <Download size={12} />
+                                </a>
+                              ) : null}
                             </div>
                           ) : (
                             <div key={item.id} className="group/album relative col-span-3 max-h-72 w-full overflow-hidden rounded-md">
@@ -823,6 +1152,7 @@ function ChatPanel({
                                   <video
                                     src={shouldLoad ? item.mediaUrl : undefined}
                                     controls
+                                    controlsList={canDownloadMedia ? undefined : 'nodownload'}
                                     preload="none"
                                     className="max-h-72 w-full rounded-md"
                                   />
@@ -836,14 +1166,16 @@ function ChatPanel({
                               >
                                 <Maximize2 size={12} />
                               </button>
-                              <a
-                                href={`${item.mediaUrl}${item.mediaUrl.includes('?') ? '&' : '?'}download=1`}
-                                download={item.mediaOriginalName || true}
-                                className="absolute right-1 top-1 rounded-full bg-black/55 p-1 text-white opacity-0 transition group-hover/album:opacity-100"
-                                title="Download video"
-                              >
-                                <Download size={12} />
-                              </a>
+                              {canDownloadMedia ? (
+                                <a
+                                  href={`${item.mediaUrl}${item.mediaUrl.includes('?') ? '&' : '?'}download=1`}
+                                  download={item.mediaOriginalName || true}
+                                  className="absolute right-1 top-1 rounded-full bg-black/55 p-1 text-white opacity-0 transition group-hover/album:opacity-100"
+                                  title="Download video"
+                                >
+                                  <Download size={12} />
+                                </a>
+                              ) : null}
                             </div>
                           ),
                         )}
@@ -867,14 +1199,16 @@ function ChatPanel({
                             )}
                           </ViewportMedia>
                         </button>
-                        <a
-                          href={`${message.mediaUrl}${message.mediaUrl.includes('?') ? '&' : '?'}download=1`}
-                          download={message.mediaOriginalName || true}
-                          className="absolute right-2 top-2 rounded-full bg-black/55 p-1.5 text-white opacity-0 transition group-hover/single:opacity-100"
-                          title="Download image"
-                        >
-                          <Download size={14} />
-                        </a>
+                        {canDownloadMedia ? (
+                          <a
+                            href={`${message.mediaUrl}${message.mediaUrl.includes('?') ? '&' : '?'}download=1`}
+                            download={message.mediaOriginalName || true}
+                            className="absolute right-2 top-2 rounded-full bg-black/55 p-1.5 text-white opacity-0 transition group-hover/single:opacity-100"
+                            title="Download image"
+                          >
+                            <Download size={14} />
+                          </a>
+                        ) : null}
                       </div>
                     ) : null}
 
@@ -888,6 +1222,7 @@ function ChatPanel({
                             <video
                               src={shouldLoad ? message.mediaUrl : undefined}
                               controls
+                              controlsList={canDownloadMedia ? undefined : 'nodownload'}
                               preload="none"
                               className="max-h-72 w-full rounded-md"
                             />
@@ -901,45 +1236,120 @@ function ChatPanel({
                         >
                           <Maximize2 size={14} />
                         </button>
-                        <a
-                          href={`${message.mediaUrl}${message.mediaUrl.includes('?') ? '&' : '?'}download=1`}
-                          download={message.mediaOriginalName || true}
-                          className="absolute right-2 top-2 rounded-full bg-black/55 p-1.5 text-white opacity-0 transition group-hover/single:opacity-100"
-                          title="Download video"
-                        >
-                          <Download size={14} />
-                        </a>
+                        {canDownloadMedia ? (
+                          <a
+                            href={`${message.mediaUrl}${message.mediaUrl.includes('?') ? '&' : '?'}download=1`}
+                            download={message.mediaOriginalName || true}
+                            className="absolute right-2 top-2 rounded-full bg-black/55 p-1.5 text-white opacity-0 transition group-hover/single:opacity-100"
+                            title="Download video"
+                          >
+                            <Download size={14} />
+                          </a>
+                        ) : null}
                       </div>
                     ) : null}
 
                     {message.mediaUrl && message.messageType === 'audio' ? (
-                      <AudioMessageBubble url={message.mediaUrl} fallbackDurationSec={message.mediaDurationSec} />
+                      <AudioMessageBubble
+                        url={message.mediaUrl}
+                        fallbackDurationSec={message.mediaDurationSec}
+                        mimeType={message.mediaMimeType}
+                        controlsList={canDownloadMedia ? undefined : 'nodownload'}
+                      />
                     ) : null}
 
                     {message.mediaUrl && message.messageType === 'file' ? (
-                      <a
-                        href={`${message.mediaUrl}${message.mediaUrl.includes('?') ? '&' : '?'}download=1`}
-                        download={message.mediaOriginalName || true}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="mb-1 flex items-center gap-3 rounded-lg bg-black/5 px-3 py-2 transition hover:bg-black/10"
-                      >
+                      <div className="mb-1 flex items-center gap-3 rounded-lg bg-black/5 px-3 py-2">
                         <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-[#00a884] text-white">
                           <FileText size={20} />
                         </div>
                         <div className="min-w-0 flex-1">
                           <p className="truncate text-sm font-medium text-[#111b21]">{getFileName(message.mediaUrl, message.mediaOriginalName)}</p>
-                          <p className="text-xs text-[#667781]">{formatFileSize(message.fileSize)} - Click to download</p>
+                          <p className="text-xs text-[#667781]">{formatFileSize(message.fileSize)} {canDownloadFile ? '- Click to download' : ''}</p>
                         </div>
-                        <Download size={18} className="text-[#667781]" />
-                      </a>
+                        {canDownloadFile ? (
+                          <a
+                            href={`${message.mediaUrl}${message.mediaUrl.includes('?') ? '&' : '?'}download=1`}
+                            download={message.mediaOriginalName || true}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="rounded-full p-1 text-[#667781] transition hover:bg-black/10"
+                            title="Download file"
+                          >
+                            <Download size={18} className="text-[#667781]" />
+                          </a>
+                        ) : null}
+                      </div>
                     ) : null}
 
                     {message.text ? (
-                      <p className="break-words whitespace-pre-wrap text-[14.2px] leading-[19px] text-[#111b21]">{message.text}</p>
+                      <p
+                        className="break-words whitespace-pre-wrap text-[14.2px] leading-[19px] text-[#111b21] select-none"
+                        title="Click to copy message"
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          copyMessageText(message.text, message.id)
+                        }}
+                      >
+                        {message.text}
+                      </p>
                     ) : null}
-                    <div className="mt-1 -mb-1 flex items-center justify-end gap-1">
-                      <span className={isDeliveredLabel ? 'text-[10px] text-[#667781]' : 'text-[11px] text-[#667781]'}>{metaText}</span>
+
+                    </div>
+
+{/* ✅ WhatsApp-style reaction bubble — bottom corner-এ */}
+{false && Array.isArray(message.reactions) && message.reactions.length > 0 ? (
+  <div
+    className={`absolute -bottom-2 z-10 flex items-center gap-0.5 rounded-full border border-white bg-white px-1.5 py-[3px] shadow-[0_1px_4px_rgba(0,0,0,0.18)] ${
+      isMine ? 'right-1.5' : 'left-1.5'
+    }`}
+  >
+    {message.reactions.map((reaction) => (
+      <button
+        key={`${message.id}-reaction-${reaction.emoji}`}
+        type="button"
+        onClick={() => reactToMessage?.(message.id, reaction.emoji)}
+        className={`flex items-center gap-0.5 text-sm leading-none transition-transform duration-150 hover:scale-125 active:scale-110 ${
+          reaction.reactedByMe ? 'opacity-100' : 'opacity-90'
+        }`}
+        title="Toggle reaction"
+      >
+        <span className="text-[15px]">{reaction.emoji}</span>
+        {reaction.count > 1 && (
+          <span className="text-[11px] font-semibold text-[#3d4f5b]">
+            {reaction.count}
+          </span>
+        )}
+      </button>
+    ))}
+  </div>
+) : null}
+                    {Array.isArray(message.reactions) && message.reactions.length > 0 ? (
+                      <div className={`-mt-1.5 relative z-10 flex ${alignAsOutgoing ? 'justify-end pr-2' : 'justify-start pl-2'}`}>
+                        <div className="flex items-center gap-0.5 rounded-full border border-white/80 bg-white px-1.5 py-[2px] shadow-[0_1px_4px_rgba(0,0,0,0.16)]">
+                          {message.reactions.map((reaction) => (
+                            <button
+                              key={`${message.id}-reaction-${reaction.emoji}`}
+                              type="button"
+                              onClick={() => openReactionDetails(message, reaction)}
+                              className={`flex items-center gap-0.5 text-sm leading-none transition-transform duration-150 hover:scale-125 active:scale-110 ${
+                                reaction.reactedByMe ? 'opacity-100' : 'opacity-90'
+                              }`}
+                              title="See who reacted"
+                            >
+                              <span className="text-[15px]">{reaction.emoji}</span>
+                              {reaction.count > 1 ? (
+                                <span className="text-[11px] font-semibold text-[#3d4f5b]">{reaction.count}</span>
+                              ) : null}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
+
+                    <div className={`mt-1 flex items-center gap-1 ${alignAsOutgoing ? 'justify-end' : 'justify-start'}`}>
+                      {copiedMessageId === message.id ? <span className="text-[10px] text-[#00a884]">Copied</span> : null}
+                      <span className="text-[10px] text-[#667781]">{metaText}</span>
                       {activeConversationType === 'direct' && isMine && !isTempMessage && message.clientStatus !== 'failed' ? (
                         <svg viewBox="0 0 16 11" height="11" width="16" className={message.seen ? 'text-[#53bdeb]' : 'text-[#8696a0]'}>
                           {message.seen ? (
@@ -952,11 +1362,23 @@ function ChatPanel({
                     </div>
                   </div>
 
+                  {activeConversationType === 'direct' && !isTempMessage ? (
+                    <button
+                      type="button"
+                      onClick={(event) => openReactionPickerAt(message, event.currentTarget)}
+                      className="mb-1 hidden rounded p-1 text-[#8696a0] opacity-0 transition hover:bg-black/5 group-hover:opacity-100 md:inline-flex"
+                      aria-label="React to message"
+                      title="React"
+                    >
+                      <SmilePlus size={14} />
+                    </button>
+                  ) : null}
+
                   {activeConversationType === 'direct' && isMine && !isTempMessage ? (
                     <button
                       type="button"
                       onClick={() => requestDeleteMessage(message.id)}
-                      className="mb-1 rounded p-1 text-[#8696a0] opacity-0 transition-opacity group-hover:opacity-100 hover:bg-black/5"
+                      className="mb-1 rounded p-1 text-[#8696a0] transition hover:bg-black/5"
                       aria-label="Delete message"
                     >
                       <Trash2 size={14} />
@@ -978,7 +1400,7 @@ function ChatPanel({
             <div className="mb-2 rounded-md bg-[#fff1f1] px-3 py-2 text-xs text-[#cc1744]">{recordingError}</div>
           ) : null}
 
-          {pendingMedia?.length > 0 ? (
+          {!isConversationBlocked && pendingMedia?.length > 0 ? (
             <div className="mb-2 rounded-lg border border-[#d7e0e4] bg-white p-2">
               <div className="mb-2 flex items-center justify-between">
                 <p className="text-xs font-semibold text-[#1f2c34]">{pendingMedia.length} media selected</p>
@@ -986,6 +1408,7 @@ function ChatPanel({
                   <button
                     type="button"
                     onClick={clearPendingMedia}
+                    disabled={!canSendToActiveChat}
                     className="text-xs font-medium text-[#667781] hover:text-[#1f2c34]"
                   >
                     Cancel
@@ -993,7 +1416,7 @@ function ChatPanel({
                   <button
                     type="button"
                     onClick={sendPendingMedia}
-                    disabled={uploadingMedia}
+                    disabled={uploadingMedia || !canSendToActiveChat}
                     className="rounded-md bg-[#25d366] px-2.5 py-1 text-xs font-semibold text-white disabled:opacity-60"
                   >
                     {uploadingMedia ? 'Sending...' : 'Send media'}
@@ -1022,12 +1445,17 @@ function ChatPanel({
             </div>
           ) : null}
 
-          <div className="flex items-center gap-2">
+          {isConversationBlocked ? (
+            <div className="rounded-2xl border border-[#ffd7df] bg-[#fff4f6] px-4 py-3 text-center text-sm font-semibold text-[#9f2f49]">
+              You can no longer message each other.
+            </div>
+          ) : (
+          <div className={`flex w-full items-center gap-2 ${isRecording ? 'flex-wrap sm:flex-nowrap' : 'flex-nowrap'}`}>
             <button
               type="button"
               onClick={() => mediaInputRef.current?.click()}
-              disabled={!activeChat || uploadingMedia || isRecording}
-              className="rounded-lg bg-white p-2 text-[#54656f] transition hover:bg-[#edf0f2] disabled:cursor-not-allowed disabled:opacity-60"
+              disabled={!canSendToActiveChat || uploadingMedia || isRecording}
+              className="shrink-0 rounded-lg bg-white p-2 text-[#54656f] transition hover:bg-[#edf0f2] disabled:cursor-not-allowed disabled:opacity-60"
               aria-label="Attach file"
             >
               <Paperclip size={18} />
@@ -1047,8 +1475,8 @@ function ChatPanel({
             <button
               type="button"
               onClick={isRecording ? stopRecording : startRecording}
-              disabled={!activeChat || uploadingMedia}
-              className={`rounded-lg p-2 transition ${
+              disabled={!canSendToActiveChat || uploadingMedia}
+              className={`shrink-0 rounded-lg p-2 transition ${
                 isRecording ? 'bg-red-500 text-white animate-pulse' : 'bg-white text-[#54656f] hover:bg-[#edf0f2]'
               } disabled:cursor-not-allowed disabled:opacity-60`}
               aria-label={isRecording ? 'Stop recording' : 'Record voice'}
@@ -1056,13 +1484,21 @@ function ChatPanel({
               {isRecording ? <Square size={18} /> : <Mic size={18} />}
             </button>
             {isRecording ? (
-              <div className="rounded-lg bg-[#fff1f1] px-3 py-2 text-xs font-semibold text-[#cc1744]">
+              <div className="order-last basis-full rounded-lg bg-[#fff1f1] px-3 py-2 text-xs font-semibold text-[#cc1744] sm:order-none sm:basis-auto">
                 Recording {formatDuration(recordingSeconds)}
               </div>
             ) : null}
             <textarea
               ref={draftInputRef}
-              placeholder={activeChat ? (isRecording ? 'Recording in progress...' : 'Type a message...') : 'Select a chat first'}
+              placeholder={
+                !activeChat
+                  ? 'Select a chat first'
+                  : hasBlockedMe
+                    ? 'This user blocked you'
+                    : isRecording
+                      ? 'Recording in progress...'
+                      : 'Type a message...'
+              }
               value={draftMessage}
               onChange={(event) => {
                 setDraftMessage(event.target.value)
@@ -1070,30 +1506,25 @@ function ChatPanel({
               }}
               onFocus={ensureInputVisible}
               onKeyDown={(event) => {
-                const isDesktop = typeof window !== 'undefined' && window.matchMedia('(min-width: 768px)').matches
-                if (event.key === 'Enter' && !event.shiftKey && !isRecording && isDesktop) {
-                  event.preventDefault()
-                  sendMessage()
-                  return
-                }
-                if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !isRecording && !isDesktop) {
+                if (event.key === 'Enter' && !event.shiftKey && !isRecording) {
                   event.preventDefault()
                   sendMessage()
                 }
               }}
-              disabled={!activeChat || isRecording}
+              disabled={!canSendToActiveChat || isRecording}
               rows={1}
-              className="max-h-28 min-h-[38px] flex-1 resize-none rounded-lg border border-[#e3e7ea] bg-white px-3 py-2 text-sm leading-5 outline-none placeholder:text-[#7a8b95] focus:border-[#25d366] disabled:cursor-not-allowed disabled:bg-[#f7f7f7]"
+              className="max-h-28 min-h-[38px] min-w-0 flex-1 resize-none rounded-lg border border-[#e3e7ea] bg-white px-3 py-2 text-sm leading-5 outline-none placeholder:text-[#7a8b95] focus:border-[#25d366] disabled:cursor-not-allowed disabled:bg-[#f7f7f7]"
             />
             <button
               type="button"
               onClick={sendMessage}
-              disabled={!activeChat || uploadingMedia || isRecording}
-              className="rounded-lg bg-[#25d366] px-4 py-2 text-sm font-semibold text-white transition hover:bg-[#1fab53] disabled:cursor-not-allowed disabled:opacity-60"
+              disabled={!canSendToActiveChat || uploadingMedia || isRecording}
+              className="shrink-0 rounded-lg bg-[#25d366] px-3 py-2 text-sm font-semibold text-white transition hover:bg-[#1fab53] disabled:cursor-not-allowed disabled:opacity-60 md:px-4"
             >
               {uploadingMedia ? 'Uploading...' : 'Send'}
             </button>
           </div>
+          )}
         </div>
       </footer>
 
@@ -1115,19 +1546,100 @@ function ChatPanel({
               <X size={16} />
             </button>
             {previewMedia.type === 'video' ? (
-              <video src={previewMedia.url} controls autoPlay className="max-h-[78vh] w-full rounded" />
+              <video
+                src={previewMedia.url}
+                controls
+                controlsList={canDownloadMedia ? undefined : 'nodownload'}
+                autoPlay
+                className="max-h-[78vh] w-full rounded"
+              />
             ) : (
               <img src={previewMedia.url} alt={previewMedia.name} className="max-h-[78vh] w-full rounded object-contain" />
             )}
-            <div className="mt-2 flex justify-end">
-              <a
-                href={`${previewMedia.url}${previewMedia.url.includes('?') ? '&' : '?'}download=1`}
-                download={previewMedia.name || true}
-                className="rounded-md bg-[#25d366] px-3 py-1.5 text-xs font-semibold text-white"
+            {canDownloadMedia ? (
+              <div className="mt-2 flex justify-end">
+                <a
+                  href={`${previewMedia.url}${previewMedia.url.includes('?') ? '&' : '?'}download=1`}
+                  download={previewMedia.name || true}
+                  className="rounded-md bg-[#25d366] px-3 py-1.5 text-xs font-semibold text-white"
+                >
+                  Download
+                </a>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
+      {reactionDetails ? (
+        <div
+          className="absolute inset-0 z-40 grid place-items-center bg-black/30 p-4 backdrop-blur-[1px]"
+          onClick={() => setReactionDetails(null)}
+        >
+          <div
+            className="w-full max-w-xs rounded-2xl bg-white p-4 shadow-[0_20px_50px_rgba(15,23,42,0.22)]"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className="text-lg font-semibold text-[#111b21]">{reactionDetails.emoji} Reactions</p>
+                <p className="text-xs text-[#667781]">{reactionDetails.reactors.length} people reacted</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setReactionDetails(null)}
+                className="inline-flex h-8 w-8 items-center justify-center rounded-full text-[#60727f] transition hover:bg-[#f1f5f9]"
+                aria-label="Close reaction details"
               >
-                Download
-              </a>
+                <X size={16} />
+              </button>
             </div>
+
+            <div className="mt-3 max-h-64 space-y-2 overflow-y-auto pr-1">
+              {reactionDetails.reactors.map((reactor) => (
+                <div key={`${reactionDetails.messageId}-${reactionDetails.emoji}-${reactor.id}`} className="flex items-center justify-between rounded-xl bg-[#f7f8fa] px-3 py-2">
+                  <span className="truncate text-sm text-[#111b21]">
+                    {reactor.username}
+                    {reactor.reactedByMe ? ' (You)' : ''}
+                  </span>
+                  <span className="ml-3 text-base leading-none">{reactionDetails.emoji}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {reactionPicker ? (
+        <div
+          className="fixed z-50 -translate-y-full rounded-full border border-[#d6e0e7] bg-white/95 px-2 py-1 shadow-[0_16px_40px_rgba(15,23,42,0.18)] backdrop-blur"
+          style={{ left: reactionPicker.x, top: reactionPicker.y, transform: reactionPicker.placeBelow ? 'translate(-50%, 0%)' : 'translate(-50%, -105%)' }}
+          onMouseDown={(event) => event.stopPropagation()}
+          onTouchStart={(event) => event.stopPropagation()}
+        >
+          <div className="flex items-center gap-1">
+            {REACTION_OPTIONS.map((emoji) => (
+              <button
+                key={`picker-${emoji}`}
+                type="button"
+                onClick={() => onReactionPick(emoji)}
+               className="rounded-full px-1.5 py-1 text-lg leading-none transition-all duration-150 
+           hover:scale-[1.35] hover:-translate-y-1 hover:bg-[#f1f5f9] active:scale-110 
+           cursor-pointer"
+                aria-label={`React with ${emoji}`}
+                title={emoji}
+              >
+                {emoji}
+              </button>
+            ))}
+            <button
+              type="button"
+              onClick={() => setReactionPicker(null)}
+              className="ml-1 inline-flex h-7 w-7 items-center justify-center rounded-full text-[#60727f] transition hover:bg-[#f1f5f9]"
+              aria-label="Close reaction picker"
+            >
+              <SmilePlus size={14} />
+            </button>
           </div>
         </div>
       ) : null}

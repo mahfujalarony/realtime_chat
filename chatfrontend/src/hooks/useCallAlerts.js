@@ -7,6 +7,8 @@ function useCallAlerts() {
   const incomingAlertTokenRef = useRef(0)
   const outgoingRingIntervalRef = useRef(null)
   const outgoingRingAudioContextRef = useRef(null)
+  const primedIncomingElementRef = useRef(null)
+  const primedAudioContextRef = useRef(null)
 
   const stopIncomingAlert = () => {
     incomingAlertTokenRef.current += 1
@@ -33,7 +35,13 @@ function useCallAlerts() {
       if (alertToken !== incomingAlertTokenRef.current) return
       const AudioCtx = window.AudioContext || window.webkitAudioContext
       if (!AudioCtx) return
-      const audioContext = new AudioCtx()
+      const audioContext =
+        primedAudioContextRef.current && primedAudioContextRef.current.state !== 'closed'
+          ? primedAudioContextRef.current
+          : new AudioCtx()
+      if (audioContext.state === 'suspended') {
+        audioContext.resume().catch(() => null)
+      }
       ringtoneAudioContextRef.current = audioContext
       const playPulse = () => {
         const now = audioContext.currentTime
@@ -57,9 +65,11 @@ function useCallAlerts() {
 
     const ringtonePath = '/sounds/incoming-call.mp3'
     try {
-      const audio = new Audio(ringtonePath)
+      const audio = primedIncomingElementRef.current || new Audio(ringtonePath)
+      audio.src = ringtonePath
       audio.loop = true
       audio.preload = 'auto'
+      audio.muted = false
       const playPromise = audio.play()
       if (playPromise && typeof playPromise.then === 'function') {
         playPromise
@@ -89,6 +99,54 @@ function useCallAlerts() {
       startBeepFallback()
     } catch {
       // ignore if autoplay policy blocks audio context
+    }
+  }
+
+  const primeAlertAudio = () => {
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext
+      if (AudioCtx) {
+        const audioContext =
+          primedAudioContextRef.current && primedAudioContextRef.current.state !== 'closed'
+            ? primedAudioContextRef.current
+            : new AudioCtx()
+        primedAudioContextRef.current = audioContext
+        if (audioContext.state === 'suspended') {
+          audioContext.resume().catch(() => null)
+        }
+      }
+    } catch {
+      // Ignore audio context priming issues.
+    }
+
+    try {
+      if (!primedIncomingElementRef.current) {
+        const audio = new Audio('/sounds/incoming-call.mp3')
+        audio.preload = 'auto'
+        audio.loop = true
+        audio.muted = true
+        primedIncomingElementRef.current = audio
+      }
+
+      const audio = primedIncomingElementRef.current
+      const playPromise = audio.play()
+      if (playPromise && typeof playPromise.then === 'function') {
+        playPromise
+          .then(() => {
+            audio.pause()
+            audio.currentTime = 0
+            audio.muted = false
+          })
+          .catch(() => {
+            audio.muted = false
+          })
+      } else {
+        audio.pause()
+        audio.currentTime = 0
+        audio.muted = false
+      }
+    } catch {
+      // Ignore media priming issues.
     }
   }
 
@@ -134,6 +192,7 @@ function useCallAlerts() {
   }
 
   return {
+    primeAlertAudio,
     stopIncomingAlert,
     playIncomingAlert,
     stopOutgoingAlert,

@@ -10,9 +10,9 @@ function PermissionHelpModal({ permissionHelp, onClose, onRetry }) {
         <p className="mt-2 text-sm text-[#54656f]">{permissionHelp.message}</p>
         <div className="mt-3 rounded-lg bg-[#f4f7f9] p-3 text-xs text-[#445762]">
           <p className="font-semibold text-[#1f2c34]">Quick fix</p>
-          <p className="mt-1">1. Browser address bar lock/info icon tap করুন</p>
-          <p>2. Camera ও Microphone = Allow করুন</p>
-          <p>3. Page reload করে আবার call দিন</p>
+          <p className="mt-1">1.Press browser address bar lock/info icon</p>
+          <p>2. Camera and Microphone = Allow</p>
+          <p>3. Reload the page and call again</p>
           <p className="mt-1 text-[#667781]">Android: Settings {`>`} Apps {`>`} Chrome {`>`} Permissions</p>
         </div>
         <div className="mt-4 flex justify-end gap-2">

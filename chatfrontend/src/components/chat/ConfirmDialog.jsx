@@ -11,22 +11,14 @@ function ConfirmDialog({ confirmAction, setConfirmAction, runConfirmAction }) {
             ? 'Delete this message?'
             : confirmAction.type === 'delete_messages'
               ? `Delete ${Array.isArray(confirmAction.messageIds) ? confirmAction.messageIds.length : 0} messages?`
-            : confirmAction.type === 'clear_chat'
-              ? 'Clear this chat?'
-              : confirmAction.type === 'delete_chat'
-                ? 'Delete this chat?'
-                : 'Logout now?'}
+              : 'Logout now?'}
         </p>
         <p className="mt-2 text-sm text-[#667781]">
           {confirmAction.type === 'delete_message'
             ? 'This message will be removed.'
             : confirmAction.type === 'delete_messages'
               ? 'Selected messages will be removed.'
-            : confirmAction.type === 'clear_chat'
-              ? 'All messages in this conversation will be removed.'
-              : confirmAction.type === 'delete_chat'
-                ? 'Chat and contact will be removed from your list.'
-                : 'You will be signed out from this device.'}
+              : 'You will be signed out from this device.'}
         </p>
         <div className="mt-4 flex justify-end gap-2">
           <Button type="button" variant="outline" onClick={() => setConfirmAction(null)} className="h-9 px-3 text-sm">

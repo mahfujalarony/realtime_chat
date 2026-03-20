@@ -50,13 +50,18 @@ const MIME_TYPES = {
   ".js": "application/javascript",
 };
 
-function getMimeType(filePath) {
+function getMimeType(filePath, requestPath = "") {
   const ext = path.extname(filePath).toLowerCase();
+  const normalizedRequestPath = String(requestPath || "").replace(/\\/g, "/").toLowerCase();
+  if (normalizedRequestPath.includes("/audios/")) {
+    if (ext === ".webm") return "audio/webm";
+    if (ext === ".mp4" || ext === ".m4a") return "audio/mp4";
+  }
   return MIME_TYPES[ext] || "application/octet-stream";
 }
 
 /* ensure upload folder exists */
-["uploads/images/single", "uploads/chat"].forEach((dir) =>
+["public/chat"].forEach((dir) =>
   fs.mkdirSync(path.join(__dirname, dir), { recursive: true })
 );
 
@@ -88,13 +93,13 @@ const server = http.createServer(async (req, res) => {
   }
 
   /* serve static uploaded files */
-  if (req.method === "GET" && req.url.startsWith("/uploads")) {
+  if (req.method === "GET" && req.url.startsWith("/public")) {
     const cleanReqPath = String(req.url || "")
       .split("?")[0]
       .replace(/\\/g, "/")
       .replace(/^\/+/, "");
     const filePath = path.join(__dirname, cleanReqPath);
-    const uploadsRoot = path.join(__dirname, "uploads");
+    const uploadsRoot = path.join(__dirname, "public");
 
     if (!filePath.startsWith(uploadsRoot)) {
       res.writeHead(400);
@@ -103,7 +108,7 @@ const server = http.createServer(async (req, res) => {
 
     if (fs.existsSync(filePath)) {
       const stat = fs.statSync(filePath);
-      const mimeType = getMimeType(filePath);
+      const mimeType = getMimeType(filePath, cleanReqPath);
       const fileName = path.basename(filePath);
       const isDownload = req.url.includes("?download=1");
       
@@ -128,17 +133,6 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
-    /* single image only (existing - don't change) */
-    if (req.method === "POST" && req.url === "/upload/image") {
-      const files = await parseMultipart(req, {
-        uploadDir: "uploads/images/single",
-        maxSize: config.LIMITS.IMAGE,
-        allowed: config.ALLOWED_IMAGES,
-      });
-
-      return send(res, files);
-    }
-
     /* create user folder for chat */
     if (req.method === "POST" && req.url === "/create-folder") {
       const data = await readJsonBody(req);
@@ -150,8 +144,8 @@ const server = http.createServer(async (req, res) => {
       }
 
       const basePath = targetPath
-        ? path.join(__dirname, "uploads", targetPath.replace(/\.\./g, ""))
-        : path.join(__dirname, "uploads", "chat", username);
+        ? path.join(__dirname, "public", targetPath.replace(/\.\./g, ""))
+        : path.join(__dirname, "public", "chat", username);
 
       /* create main folder + subfolders for all media types */
       fs.mkdirSync(basePath, { recursive: true });
@@ -183,7 +177,7 @@ const server = http.createServer(async (req, res) => {
         return res.end(JSON.stringify({ success: false, error: "username is required" }));
       }
 
-      const userFolder = path.join("uploads", "chat", username, mediaType);
+      const userFolder = path.join("public", "chat", username, mediaType);
       const absoluteFolder = path.join(__dirname, userFolder);
 
       /* ensure user folder exists */
@@ -233,8 +227,8 @@ const server = http.createServer(async (req, res) => {
       const mediaType = deleteMatch[2];
       const filename = decodeURIComponent(deleteMatch[3]);
 
-      const filePath = path.join(__dirname, "uploads", "chat", username, mediaType, filename);
-      const uploadsRoot = path.join(__dirname, "uploads");
+      const filePath = path.join(__dirname, "public", "chat", username, mediaType, filename);
+      const uploadsRoot = path.join(__dirname, "public");
 
       /* security: ensure path is within uploads folder */
       if (!filePath.startsWith(uploadsRoot)) {
@@ -257,8 +251,8 @@ const server = http.createServer(async (req, res) => {
     const deleteFolderMatch = req.url.match(/^\/delete-folder\/chat\/([^/?]+)/);
     if (req.method === "DELETE" && deleteFolderMatch) {
       const username = decodeURIComponent(deleteFolderMatch[1]);
-      const folderPath = path.join(__dirname, "uploads", "chat", username);
-      const uploadsRoot = path.join(__dirname, "uploads");
+      const folderPath = path.join(__dirname, "public", "chat", username);
+      const uploadsRoot = path.join(__dirname, "public");
 
       if (!folderPath.startsWith(uploadsRoot)) {
         res.writeHead(400, { "Content-Type": "application/json" });
