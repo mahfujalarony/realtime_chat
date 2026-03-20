@@ -777,6 +777,19 @@ async function start() {
           allowNull: true,
         })
       }
+      if (!usersTable.failed_login_attempts) {
+        await queryInterface.addColumn('users', 'failed_login_attempts', {
+          type: DataTypes.INTEGER,
+          allowNull: false,
+          defaultValue: 0,
+        })
+      }
+      if (!usersTable.login_locked_until) {
+        await queryInterface.addColumn('users', 'login_locked_until', {
+          type: DataTypes.DATE,
+          allowNull: true,
+        })
+      }
       await sequelize.query("UPDATE users SET can_handle_external_chat = 0 WHERE role IN ('admin','model_admin')").catch(() => null)
       await sequelize.query("UPDATE users SET can_download_conversations = 1 WHERE role = 'admin'").catch(() => null)
       await sequelize.query("UPDATE users SET can_edit_conversation_note = 1 WHERE role = 'admin'").catch(() => null)

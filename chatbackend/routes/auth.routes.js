@@ -6,6 +6,7 @@ const { signAccessToken, signRefreshToken, verifyRefreshToken } = require('../ut
 const { ensureUserFolder, deleteUserFolder } = require('../utils/upload-server')
 const { buildUnusedUniqueUsername, ensureUserUniqueUsername } = require('../utils/user-identity')
 const { setRefreshTokenCookie, clearRefreshTokenCookie, getRefreshTokenFromRequest } = require('../utils/cookies')
+const { getThrottleState, recordFailedLogin, clearFailedLoginState, getRateLimitMessage } = require('../utils/login-rate-limit')
 
 const router = express.Router()
 
@@ -182,6 +183,11 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ message: 'identifier (or username) and password are required' })
     }
 
+    const throttleState = getThrottleState(req, identifier)
+    if (throttleState.blocked) {
+      return res.status(429).json({ message: getRateLimitMessage(throttleState.remainingMs) })
+    }
+
     let user = await User.scope('withPassword').findOne({
       where: {
         [Op.or]: [{ uniqueUsername: identifier }, { email: identifier }, { mobileNumber: identifier }],
@@ -206,10 +212,15 @@ router.post('/login', async (req, res) => {
 
     const valid = await user.comparePassword(password)
     if (!valid) {
+      const failedState = recordFailedLogin(req, identifier)
+      if (failedState.blocked) {
+        return res.status(429).json({ message: getRateLimitMessage(failedState.remainingMs) })
+      }
       return res.status(401).json({ message: 'Invalid credentials' })
     }
 
     await ensureUserUniqueUsername(user, User)
+    clearFailedLoginState(req, identifier)
     user.lastSeen = new Date()
     await user.save()
 

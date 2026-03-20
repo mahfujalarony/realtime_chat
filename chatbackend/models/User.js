@@ -42,6 +42,15 @@ module.exports = (sequelize, DataTypes) => {
         type: DataTypes.STRING(255),
         allowNull: false,
       },
+      failedLoginAttempts: {
+        type: DataTypes.INTEGER,
+        allowNull: false,
+        defaultValue: 0,
+      },
+      loginLockedUntil: {
+        type: DataTypes.DATE,
+        allowNull: true,
+      },
       lastSeen: {
         type: DataTypes.DATE,
         allowNull: true,
@@ -87,11 +96,11 @@ module.exports = (sequelize, DataTypes) => {
       tableName: 'users',
       underscored: true,
       defaultScope: {
-        attributes: { exclude: ['passwordHash'] },
+        attributes: { exclude: ['passwordHash', 'failedLoginAttempts', 'loginLockedUntil'] },
       },
       scopes: {
         withPassword: {
-          attributes: { include: ['passwordHash'] },
+          attributes: { include: ['passwordHash', 'failedLoginAttempts', 'loginLockedUntil'] },
         },
       },
     },
